@@ -1,30 +1,32 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { z } from 'zod';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
+
+// ─────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────
 
 const CONFIG_DIR = path.join(os.homedir(), '.clawport');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
-const LOG_DIR = path.join(CONFIG_DIR, 'logs');
-const SYNC_LOG_PATH = path.join(LOG_DIR, 'sync.log');
-const SYNC_PID_PATH = path.join(CONFIG_DIR, 'sync.pid');
+const OPENCLAW_DIR = path.join(os.homedir(), '.openclaw');
 
 type ClawportConfig = {
   apiKey: string;
-  profile: string;
-  profileId?: string;
-  instanceName: string;
-  interval: string;
+  profileId: string;
   apiBaseUrl: string;
   connectedAt: string;
 };
 
-function ensureConfigDir() {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+type FileInfo = {
+  path: string;
+  size: number;
+  content?: string;
+};
+
+function ensureDir(dir: string) {
+  fs.mkdirSync(dir, { recursive: true });
 }
 
 function readConfig(): ClawportConfig | null {
@@ -33,23 +35,21 @@ function readConfig(): ClawportConfig | null {
 }
 
 function writeConfig(cfg: ClawportConfig) {
-  ensureConfigDir();
+  ensureDir(CONFIG_DIR);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-function parseIntervalToMinutes(interval: string): number {
-  const m = interval.trim().toLowerCase().match(/^(\d+)(m|h)$/);
-  if (!m) return 30;
-  const n = Number(m[1]);
-  return m[2] === 'h' ? n * 60 : n;
-}
+// ─────────────────────────────────────────────────────────────
+// API Helpers
+// ─────────────────────────────────────────────────────────────
 
-function appendSyncLog(line: string) {
-  ensureConfigDir();
-  fs.appendFileSync(SYNC_LOG_PATH, `[${new Date().toISOString()}] ${line}\n`);
-}
-
-async function apiRequest(baseUrl: string, endpoint: string, method: 'GET' | 'POST', apiKey: string, body?: unknown) {
+async function api(
+  baseUrl: string,
+  endpoint: string,
+  method: 'GET' | 'POST',
+  apiKey: string,
+  body?: unknown
+) {
   const res = await fetch(`${baseUrl}${endpoint}`, {
     method,
     headers: {
@@ -58,267 +58,446 @@ async function apiRequest(baseUrl: string, endpoint: string, method: 'GET' | 'PO
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.message || json.error || `HTTP ${res.status}`);
+  if (!res.ok) throw new Error(json.error || json.message || `HTTP ${res.status}`);
   return json;
 }
 
-async function runSyncCycle(cfg: ClawportConfig) {
-  const heartbeat = await apiRequest(cfg.apiBaseUrl, '/api/v1/instances/heartbeat', 'POST', cfg.apiKey, {
-    profileId: cfg.profileId,
-    instanceName: cfg.instanceName,
-  });
+// ─────────────────────────────────────────────────────────────
+// OpenClaw File Discovery
+// ─────────────────────────────────────────────────────────────
 
-  const run = await apiRequest(cfg.apiBaseUrl, '/api/v1/sync/run', 'POST', cfg.apiKey, {
-    profileId: cfg.profileId,
-    instanceName: cfg.instanceName,
-    changed: false,
-    message: 'Periodic sync cycle',
-  });
+const INCLUDE_PATTERNS = [
+  'workspace/*.md',
+  'workspace/memory/*.md',
+  'workspace/memory/**/*.md',
+  'workspace/skills/**',
+  'workspace/canvas/**',
+  'skills/**',
+  'agents/*/config.json',
+];
 
-  appendSyncLog(`heartbeat=${heartbeat.heartbeatAt} syncRun=${run?.run?.id || 'ok'}`);
+const EXCLUDE_PATTERNS = [
+  'credentials/**',
+  'agents/*/sessions/**',
+  'memory/lancedb/**',
+  'memory/*.sqlite',
+  '*.lock',
+  '*.wal',
+  '*.shm',
+  'node_modules/**',
+  '.git/**',
+  '.DS_Store',
+  'Thumbs.db',
+];
+
+function matchGlob(filePath: string, pattern: string): boolean {
+  let regexPattern = pattern
+    .replace(/\./g, '\\.')
+    .replace(/\*\*\//g, '(.*/)?')
+    .replace(/\*\*/g, '.*')
+    .replace(/\*/g, '[^/]*');
+  return new RegExp(`^${regexPattern}$`).test(filePath);
 }
 
+function shouldInclude(relativePath: string): boolean {
+  for (const pattern of EXCLUDE_PATTERNS) {
+    if (matchGlob(relativePath, pattern)) return false;
+  }
+  for (const pattern of INCLUDE_PATTERNS) {
+    if (matchGlob(relativePath, pattern)) return true;
+  }
+  return false;
+}
+
+function discoverFiles(baseDir: string): FileInfo[] {
+  const files: FileInfo[] = [];
+
+  function walk(dir: string, relativePath: string = '') {
+    if (!fs.existsSync(dir)) return;
+
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      const relPath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+
+      if (entry.isDirectory()) {
+        walk(fullPath, relPath);
+      } else if (entry.isFile()) {
+        if (shouldInclude(relPath)) {
+          const stats = fs.statSync(fullPath);
+          files.push({
+            path: relPath,
+            size: stats.size,
+          });
+        }
+      }
+    }
+  }
+
+  walk(baseDir);
+  return files;
+}
+
+// ─────────────────────────────────────────────────────────────
+// CLI Program
+// ─────────────────────────────────────────────────────────────
+
 const program = new Command();
-program.name('clawport').description('ClawPort CLI').version('0.2.0');
+program.name('clawport').description('Backup and restore your OpenClaw workspace').version('1.0.0');
+
+// ─────────────────────────────────────────────────────────────
+// clawport login
+// ─────────────────────────────────────────────────────────────
 
 program
-  .command('init')
-  .description('Initialize local config')
-  .option('--api-base-url <url>', 'API base URL', 'https://clawport-3a35.vercel.app')
-  .action((opts) => {
-    if (readConfig()) return console.log(`Config already exists at ${CONFIG_PATH}`);
-    writeConfig({
-      apiKey: '',
-      profile: 'default-profile',
-      instanceName: 'default-instance',
-      interval: '30m',
-      apiBaseUrl: opts.apiBaseUrl,
-      connectedAt: '',
-    });
-    console.log(`Initialized ${CONFIG_PATH}`);
+  .command('login')
+  .description('Connect to ClawPort with your API key')
+  .requiredOption('--api-key <key>', 'Your ClawPort API key')
+  .option('--api-url <url>', 'API base URL', 'http://localhost:3001')
+  .action(async (opts) => {
+    try {
+      const connectJson = await api(opts.apiUrl, '/api/v1/profile/connect', 'POST', opts.apiKey, {
+        profileName: 'default',
+        instanceName: os.hostname(),
+        syncIntervalMinutes: 60,
+      });
+
+      writeConfig({
+        apiKey: opts.apiKey,
+        profileId: connectJson.profileId,
+        apiBaseUrl: opts.apiUrl,
+        connectedAt: new Date().toISOString(),
+      });
+
+      console.log('✓ Logged in');
+      console.log(`  Profile ID: ${connectJson.profileId}`);
+    } catch (e) {
+      console.error(`✗ Login failed: ${(e as Error).message}`);
+      process.exit(1);
+    }
   });
 
+// ─────────────────────────────────────────────────────────────
+// clawport backup
+// ─────────────────────────────────────────────────────────────
+
 program
-  .command('connect')
-  .description('Connect this host to a profile')
-  .requiredOption('--api-key <key>', 'API key')
-  .requiredOption('--profile <name>', 'Profile name')
-  .requiredOption('--instance-name <name>', 'Instance name')
-  .option('--interval <interval>', 'Sync interval, e.g. 30m or 1h', '30m')
-  .option('--api-base-url <url>', 'API base URL', 'https://clawport-3a35.vercel.app')
+  .command('backup')
+  .description('Backup your OpenClaw workspace to the cloud')
+  .option('--dry-run', 'Show what would be backed up without uploading')
   .action(async (opts) => {
-    const parsed = z.object({
-      apiKey: z.string().min(10),
-      profile: z.string().min(1),
-      instanceName: z.string().min(1),
-      interval: z.string().min(2),
-      apiBaseUrl: z.string().url(),
-    }).safeParse(opts);
-    if (!parsed.success) {
-      console.error(parsed.error.issues.map((i) => i.message).join(', '));
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
       process.exit(1);
     }
 
-    const p = parsed.data;
-    const minutes = parseIntervalToMinutes(p.interval);
-    const json = await apiRequest(p.apiBaseUrl, '/api/v1/profile/connect', 'POST', p.apiKey, {
-      profileName: p.profile,
-      instanceName: p.instanceName,
-      syncIntervalMinutes: minutes,
-    });
+    if (!fs.existsSync(OPENCLAW_DIR)) {
+      console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
+      process.exit(1);
+    }
 
-    writeConfig({
-      apiKey: p.apiKey,
-      profile: p.profile,
-      profileId: json.profileId,
-      instanceName: p.instanceName,
-      interval: p.interval,
-      apiBaseUrl: p.apiBaseUrl,
-      connectedAt: new Date().toISOString(),
-    });
+    console.log('Discovering files...');
+    const files = discoverFiles(OPENCLAW_DIR);
 
-    console.log('✅ Connected');
-    console.log(`- Profile ID: ${json.profileId}`);
-  });
+    if (files.length === 0) {
+      console.error('✗ No files found to backup');
+      process.exit(1);
+    }
 
-program
-  .command('status')
-  .description('Show status')
-  .action(async () => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
-    const json = await apiRequest(cfg.apiBaseUrl, `/api/v1/profile/status?profileId=${cfg.profileId}`, 'GET', cfg.apiKey);
-    console.log(`Profile: ${json.profile?.name || cfg.profile}`);
-    console.log(`Instance: ${json.instance?.name || cfg.instanceName}`);
-    console.log(`State: ${json.instance?.status || 'unknown'}`);
-    console.log(`Last heartbeat: ${json.instance?.last_heartbeat_at || 'n/a'}`);
-  });
+    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+    const categories = {
+      workspace: files.filter(f => f.path.startsWith('workspace/')),
+      skills: files.filter(f => f.path.startsWith('skills/')),
+      agents: files.filter(f => f.path.startsWith('agents/')),
+    };
 
-program
-  .command('disconnect')
-  .description('Disconnect local instance and remove config')
-  .action(async () => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) {
-      console.log('Already disconnected.');
+    console.log(`Found ${files.length} files (${(totalSize / 1024).toFixed(1)} KB):`);
+    if (categories.workspace.length) console.log(`  • workspace: ${categories.workspace.length} files`);
+    if (categories.skills.length) console.log(`  • skills: ${categories.skills.length} files`);
+    if (categories.agents.length) console.log(`  • agents: ${categories.agents.length} files`);
+
+    if (opts.dryRun) {
+      console.log('\n[Dry run] Files that would be backed up:');
+      files.forEach(f => console.log(`  ${f.path} (${f.size} bytes)`));
       return;
     }
 
     try {
-      await apiRequest(cfg.apiBaseUrl, '/api/v1/profile/disconnect', 'POST', cfg.apiKey, {
-        profileId: cfg.profileId,
-        instanceName: cfg.instanceName,
-      });
-    } catch (e) {
-      console.warn(`Server disconnect warning: ${(e as Error).message}`);
-    }
+      // Step 1: Create snapshot record and get signed upload URLs
+      console.log('\nCreating backup...');
+      const { snapshotId, uploadUrls } = await api(
+        cfg.apiBaseUrl,
+        '/api/v1/backups/prepare',
+        'POST',
+        cfg.apiKey,
+        {
+          profileId: cfg.profileId,
+          files: files.map(f => ({ path: f.path, size: f.size })),
+        }
+      );
 
-    if (fs.existsSync(CONFIG_PATH)) fs.unlinkSync(CONFIG_PATH);
-    if (fs.existsSync(SYNC_PID_PATH)) fs.unlinkSync(SYNC_PID_PATH);
-    console.log('Disconnected.');
-  });
+      // Step 2: Upload each file via signed URLs
+      console.log(`Uploading ${files.length} files...`);
+      let uploaded = 0;
 
-const snapshot = program.command('snapshot').description('Snapshot operations');
+      for (const file of files) {
+        const fullPath = path.join(OPENCLAW_DIR, file.path);
+        const content = fs.readFileSync(fullPath);
 
-snapshot
-  .command('create')
-  .description('Create snapshot')
-  .option('--changed-files <n>', 'Changed files count', '0')
-  .option('--size-bytes <n>', 'Snapshot size in bytes', '0')
-  .action(async (opts) => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
+        const uploadRes = await fetch(uploadUrls[file.path], {
+          method: 'PUT',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: content,
+        });
 
-    const json = await apiRequest(cfg.apiBaseUrl, '/api/v1/snapshots/create', 'POST', cfg.apiKey, {
-      profileId: cfg.profileId,
-      trigger: 'manual',
-      version: 'v1',
-      changedFilesCount: Number(opts.changedFiles || 0),
-      sizeBytes: Number(opts.sizeBytes || 0),
-    });
+        if (!uploadRes.ok) {
+          const errText = await uploadRes.text();
+          throw new Error(`Failed to upload ${file.path}: ${uploadRes.status} ${errText}`);
+        }
 
-    console.log('✅ Snapshot created');
-    console.log(`- Snapshot ID: ${json.snapshot.id}`);
-    console.log(`- Status: ${json.snapshot.status}`);
-  });
-
-snapshot
-  .command('list')
-  .description('List snapshots')
-  .option('--limit <n>', 'Limit', '10')
-  .action(async (opts) => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
-    const json = await apiRequest(cfg.apiBaseUrl, `/api/v1/snapshots/list?profileId=${cfg.profileId}&limit=${Number(opts.limit || 10)}`, 'GET', cfg.apiKey);
-    if (!json.snapshots?.length) return console.log('No snapshots yet.');
-    json.snapshots.forEach((s: any) => {
-      console.log(`${s.id} | ${s.status} | ${s.created_at} | changed=${s.changed_files_count ?? 0}`);
-    });
-  });
-
-snapshot
-  .command('restore')
-  .description('Restore snapshot by id')
-  .requiredOption('--snapshot-id <id>', 'Snapshot ID')
-  .action(async (opts) => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
-    const json = await apiRequest(cfg.apiBaseUrl, '/api/v1/snapshots/restore', 'POST', cfg.apiKey, {
-      profileId: cfg.profileId,
-      snapshotId: opts.snapshotId,
-    });
-    console.log(`✅ Restored snapshot: ${json.restoredSnapshotId}`);
-  });
-
-const sync = program.command('sync').description('Sync operations');
-
-sync
-  .command('run')
-  .description('Run one sync cycle now')
-  .action(async () => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
-    await runSyncCycle(cfg);
-    console.log('✅ Sync cycle completed');
-  });
-
-sync
-  .command('start')
-  .description('Start background sync loop')
-  .action(() => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) return console.log('Not connected. Run clawport connect ...');
-    if (fs.existsSync(SYNC_PID_PATH)) {
-      const pid = fs.readFileSync(SYNC_PID_PATH, 'utf8').trim();
-      if (pid) return console.log(`Sync loop already running (pid ${pid})`);
-    }
-
-    ensureConfigDir();
-    const child = spawn(process.execPath, [process.argv[1], 'sync', 'worker'], {
-      detached: true,
-      stdio: 'ignore',
-      env: process.env,
-    });
-    child.unref();
-    fs.writeFileSync(SYNC_PID_PATH, String(child.pid));
-    console.log(`✅ Sync loop started (pid ${child.pid})`);
-    console.log(`Log: ${SYNC_LOG_PATH}`);
-  });
-
-sync
-  .command('stop')
-  .description('Stop background sync loop')
-  .action(() => {
-    if (!fs.existsSync(SYNC_PID_PATH)) return console.log('Sync loop not running.');
-    const pid = Number(fs.readFileSync(SYNC_PID_PATH, 'utf8').trim());
-    if (!pid) return console.log('Invalid pid file.');
-    try {
-      process.kill(pid);
-      fs.unlinkSync(SYNC_PID_PATH);
-      console.log(`✅ Stopped sync loop (pid ${pid})`);
-    } catch (e) {
-      console.log(`Could not stop pid ${pid}: ${(e as Error).message}`);
-    }
-  });
-
-sync
-  .command('logs')
-  .description('Tail sync log')
-  .option('--lines <n>', 'Line count', '40')
-  .action((opts) => {
-    if (!fs.existsSync(SYNC_LOG_PATH)) return console.log('No sync log yet.');
-    const lines = fs.readFileSync(SYNC_LOG_PATH, 'utf8').trim().split('\n');
-    const n = Number(opts.lines || 40);
-    console.log(lines.slice(-n).join('\n'));
-  });
-
-sync
-  .command('worker')
-  .description('Internal worker loop')
-  .action(async () => {
-    const cfg = readConfig();
-    if (!cfg?.profileId) process.exit(1);
-
-    appendSyncLog('worker started');
-
-    try {
-      await runSyncCycle(cfg);
-    } catch (e) {
-      appendSyncLog(`initial cycle failed: ${(e as Error).message}`);
-    }
-
-    const intervalMs = parseIntervalToMinutes(cfg.interval) * 60_000;
-    setInterval(async () => {
-      try {
-        const fresh = readConfig();
-        if (!fresh?.profileId) return;
-        await runSyncCycle(fresh);
-      } catch (e) {
-        appendSyncLog(`cycle failed: ${(e as Error).message}`);
+        uploaded++;
+        process.stdout.write(`\r  Uploaded: ${uploaded}/${files.length}`);
       }
-    }, intervalMs);
+      console.log('');
+
+      // Step 3: Confirm backup
+      await api(cfg.apiBaseUrl, '/api/v1/backups/confirm', 'POST', cfg.apiKey, {
+        snapshotId,
+        profileId: cfg.profileId,
+      });
+
+      console.log('\n✓ Backup complete!');
+      console.log(`  Snapshot ID: ${snapshotId}`);
+      console.log(`  Files: ${files.length}`);
+      console.log(`  Size: ${(totalSize / 1024).toFixed(1)} KB`);
+    } catch (e) {
+      console.error(`\n✗ Backup failed: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawport restore
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('restore')
+  .description('Restore your OpenClaw workspace from the cloud')
+  .option('--snapshot <id>', 'Specific snapshot ID to restore (default: latest)')
+  .option('--dry-run', 'Show what would be restored without extracting')
+  .action(async (opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      // Get snapshot info, file list, and signed download URLs
+      console.log('Fetching backup...');
+      const { snapshot, files, downloadUrls } = await api(
+        cfg.apiBaseUrl,
+        '/api/v1/backups/download',
+        'POST',
+        cfg.apiKey,
+        {
+          profileId: cfg.profileId,
+          snapshotId: opts.snapshot || null,
+        }
+      );
+
+      const totalSize = files.reduce((sum: number, f: FileInfo) => sum + f.size, 0);
+
+      console.log(`Found backup from ${new Date(snapshot.created_at).toLocaleString()}`);
+      console.log(`  Files: ${files.length}`);
+      console.log(`  Size: ${(totalSize / 1024).toFixed(1)} KB`);
+
+      if (opts.dryRun) {
+        console.log('\n[Dry run] Files that would be restored:');
+        files.forEach((f: FileInfo) => console.log(`  ${f.path}`));
+        return;
+      }
+
+      // Download and restore each file via signed URLs
+      console.log('\nDownloading files...');
+      let downloaded = 0;
+
+      for (const file of files as FileInfo[]) {
+        const res = await fetch(downloadUrls[file.path]);
+        if (!res.ok) {
+          throw new Error(`Failed to download ${file.path}: ${res.status}`);
+        }
+
+        const content = Buffer.from(await res.arrayBuffer());
+        const targetPath = path.join(OPENCLAW_DIR, file.path);
+
+        // Ensure directory exists
+        ensureDir(path.dirname(targetPath));
+
+        // Write file
+        fs.writeFileSync(targetPath, content);
+
+        downloaded++;
+        process.stdout.write(`\r  Downloaded: ${downloaded}/${files.length}`);
+      }
+      console.log('');
+
+      console.log('\n✓ Restore complete!');
+      console.log(`  Restored to: ${OPENCLAW_DIR}`);
+      console.log(`  Files: ${files.length}`);
+    } catch (e) {
+      console.error(`\n✗ Restore failed: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawport list
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('list')
+  .description('List your backups')
+  .option('--limit <n>', 'Number of backups to show', '10')
+  .action(async (opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { snapshots } = await api(
+        cfg.apiBaseUrl,
+        `/api/v1/snapshots/list?profileId=${cfg.profileId}&limit=${opts.limit}`,
+        'GET',
+        cfg.apiKey
+      );
+
+      if (!snapshots?.length) {
+        console.log('No backups yet. Run: clawport backup');
+        return;
+      }
+
+      console.log('Your backups:\n');
+      console.log('ID                                   | Date                 | Files | Size');
+      console.log('─'.repeat(80));
+
+      for (const s of snapshots) {
+        const date = new Date(s.created_at).toLocaleString();
+        const size = s.size_bytes ? `${(s.size_bytes / 1024).toFixed(1)} KB` : 'N/A';
+        const files = s.changed_files_count || 'N/A';
+        console.log(`${s.id} | ${date.padEnd(20)} | ${String(files).padEnd(5)} | ${size}`);
+      }
+
+      console.log(`\nTotal: ${snapshots.length} backup(s)`);
+    } catch (e) {
+      console.error(`✗ Failed to list backups: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawport files
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('files')
+  .description('List files in a backup')
+  .option('--snapshot <id>', 'Snapshot ID (default: latest)')
+  .action(async (opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { snapshot, files } = await api(
+        cfg.apiBaseUrl,
+        '/api/v1/backups/files',
+        'POST',
+        cfg.apiKey,
+        {
+          profileId: cfg.profileId,
+          snapshotId: opts.snapshot || null,
+        }
+      );
+
+      console.log(`Backup: ${snapshot.id}`);
+      console.log(`Date: ${new Date(snapshot.created_at).toLocaleString()}\n`);
+
+      // Group by directory
+      const tree: Record<string, FileInfo[]> = {};
+      for (const f of files as FileInfo[]) {
+        const dir = path.dirname(f.path);
+        if (!tree[dir]) tree[dir] = [];
+        tree[dir].push(f);
+      }
+
+      for (const dir of Object.keys(tree).sort()) {
+        console.log(`📁 ${dir}/`);
+        for (const f of tree[dir]) {
+          const name = path.basename(f.path);
+          console.log(`   📄 ${name} (${f.size} bytes)`);
+        }
+      }
+
+      console.log(`\nTotal: ${files.length} files`);
+    } catch (e) {
+      console.error(`✗ Failed to list files: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawport status
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('status')
+  .description('Show current status')
+  .action(async () => {
+    const cfg = readConfig();
+
+    console.log('ClawPort Status\n');
+
+    if (cfg) {
+      console.log(`✓ Logged in`);
+      console.log(`  Profile ID: ${cfg.profileId}`);
+      console.log(`  API: ${cfg.apiBaseUrl}`);
+    } else {
+      console.log(`✗ Not logged in`);
+      console.log(`  Run: clawport login --api-key <key>`);
+    }
+
+    console.log('');
+    if (fs.existsSync(OPENCLAW_DIR)) {
+      const files = discoverFiles(OPENCLAW_DIR);
+      const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+      console.log(`✓ OpenClaw found: ${OPENCLAW_DIR}`);
+      console.log(`  Backupable files: ${files.length} (${(totalSize / 1024).toFixed(1)} KB)`);
+    } else {
+      console.log(`✗ OpenClaw not found: ${OPENCLAW_DIR}`);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawport logout
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('logout')
+  .description('Remove local credentials')
+  .action(() => {
+    if (fs.existsSync(CONFIG_PATH)) {
+      fs.unlinkSync(CONFIG_PATH);
+      console.log('✓ Logged out');
+    } else {
+      console.log('Already logged out');
+    }
   });
 
 program.parseAsync(process.argv);
