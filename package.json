@@ -1,19 +1,24 @@
 {
-  "name": "clawport-cli",
+  "name": "clawspace",
   "version": "0.1.0",
-  "private": true,
+  "description": "Backup and restore your OpenClaw workspace",
   "type": "module",
   "bin": {
-    "clawport": "dist/index.js"
+    "clawspace": "dist/index.js"
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "tsup src/index.ts --format esm --dts --clean",
+    "build": "tsup src/index.ts --format esm --clean",
+    "prepublishOnly": "npm run build",
     "start": "tsx src/index.ts"
   },
+  "keywords": ["openclaw", "clawspace", "backup", "restore", "cli"],
+  "license": "MIT",
   "dependencies": {
-    "commander": "^12.1.0",
-    "zod": "^3.23.8"
+    "commander": "^12.1.0"
   },
   "devDependencies": {
     "tsup": "^8.2.4",

@@ -8,11 +8,11 @@ import os from 'node:os';
 // Config
 // ─────────────────────────────────────────────────────────────
 
-const CONFIG_DIR = path.join(os.homedir(), '.clawport');
+const CONFIG_DIR = path.join(os.homedir(), '.clawspace');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const OPENCLAW_DIR = path.join(os.homedir(), '.openclaw');
 
-type ClawportConfig = {
+type ClawspaceConfig = {
   apiKey: string;
   profileId: string;
   apiBaseUrl: string;
@@ -29,12 +29,12 @@ function ensureDir(dir: string) {
   fs.mkdirSync(dir, { recursive: true });
 }
 
-function readConfig(): ClawportConfig | null {
+function readConfig(): ClawspaceConfig | null {
   if (!fs.existsSync(CONFIG_PATH)) return null;
   return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
 }
 
-function writeConfig(cfg: ClawportConfig) {
+function writeConfig(cfg: ClawspaceConfig) {
   ensureDir(CONFIG_DIR);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
@@ -54,7 +54,7 @@ async function api(
     method,
     headers: {
       'content-type': 'application/json',
-      'x-clawport-api-key': apiKey,
+      'x-clawspace-api-key': apiKey,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -144,17 +144,17 @@ function discoverFiles(baseDir: string): FileInfo[] {
 // ─────────────────────────────────────────────────────────────
 
 const program = new Command();
-program.name('clawport').description('Backup and restore your OpenClaw workspace').version('1.0.0');
+program.name('clawspace').description('Backup and restore your OpenClaw workspace').version('0.1.0');
 
 // ─────────────────────────────────────────────────────────────
-// clawport login
+// clawspace login
 // ─────────────────────────────────────────────────────────────
 
 program
   .command('login')
-  .description('Connect to ClawPort with your API key')
-  .requiredOption('--api-key <key>', 'Your ClawPort API key')
-  .option('--api-url <url>', 'API base URL', 'http://localhost:3001')
+  .description('Connect to ClawSpace with your API key')
+  .requiredOption('--api-key <key>', 'Your ClawSpace API key')
+  .option('--api-url <url>', 'API base URL', 'https://clawspace.vercel.app')
   .action(async (opts) => {
     try {
       const connectJson = await api(opts.apiUrl, '/api/v1/profile/connect', 'POST', opts.apiKey, {
@@ -179,7 +179,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport backup
+// clawspace backup
 // ─────────────────────────────────────────────────────────────
 
 program
@@ -189,7 +189,7 @@ program
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
-      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      console.error('✗ Not logged in. Run: clawspace login --api-key <key>');
       process.exit(1);
     }
 
@@ -279,7 +279,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport restore
+// clawspace restore
 // ─────────────────────────────────────────────────────────────
 
 program
@@ -290,7 +290,7 @@ program
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
-      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      console.error('✗ Not logged in. Run: clawspace login --api-key <key>');
       process.exit(1);
     }
 
@@ -354,7 +354,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport list
+// clawspace list
 // ─────────────────────────────────────────────────────────────
 
 program
@@ -364,7 +364,7 @@ program
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
-      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      console.error('✗ Not logged in. Run: clawspace login --api-key <key>');
       process.exit(1);
     }
 
@@ -377,7 +377,7 @@ program
       );
 
       if (!snapshots?.length) {
-        console.log('No backups yet. Run: clawport backup');
+        console.log('No backups yet. Run: clawspace backup');
         return;
       }
 
@@ -400,7 +400,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport files
+// clawspace files
 // ─────────────────────────────────────────────────────────────
 
 program
@@ -410,7 +410,7 @@ program
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
-      console.error('✗ Not logged in. Run: clawport login --api-key <key>');
+      console.error('✗ Not logged in. Run: clawspace login --api-key <key>');
       process.exit(1);
     }
 
@@ -453,7 +453,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport status
+// clawspace status
 // ─────────────────────────────────────────────────────────────
 
 program
@@ -462,7 +462,7 @@ program
   .action(async () => {
     const cfg = readConfig();
 
-    console.log('ClawPort Status\n');
+    console.log('ClawSpace Status\n');
 
     if (cfg) {
       console.log(`✓ Logged in`);
@@ -470,7 +470,7 @@ program
       console.log(`  API: ${cfg.apiBaseUrl}`);
     } else {
       console.log(`✗ Not logged in`);
-      console.log(`  Run: clawport login --api-key <key>`);
+      console.log(`  Run: clawspace login --api-key <key>`);
     }
 
     console.log('');
@@ -485,7 +485,7 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
-// clawport logout
+// clawspace logout
 // ─────────────────────────────────────────────────────────────
 
 program
