@@ -144,7 +144,7 @@ function discoverFiles(baseDir: string): FileInfo[] {
 // ─────────────────────────────────────────────────────────────
 
 const program = new Command();
-program.name('clawspace').description('Backup and restore your OpenClaw workspace').version('0.1.0');
+program.name('clawspace').description('Backup and restore your OpenClaw workspace').version('0.1.1');
 
 // ─────────────────────────────────────────────────────────────
 // clawspace login
@@ -154,7 +154,7 @@ program
   .command('login')
   .description('Connect to ClawSpace with your API key')
   .requiredOption('--api-key <key>', 'Your ClawSpace API key')
-  .option('--api-url <url>', 'API base URL', 'https://clawspace.vercel.app')
+  .option('--api-url <url>', 'API base URL', 'https://clawspace-poc.vercel.app')
   .action(async (opts) => {
     try {
       const connectJson = await api(opts.apiUrl, '/api/v1/profile/connect', 'POST', opts.apiKey, {
