@@ -273,7 +273,15 @@ program
       console.log(`  Files: ${files.length}`);
       console.log(`  Size: ${(totalSize / 1024).toFixed(1)} KB`);
     } catch (e) {
-      console.error(`\n✗ Backup failed: ${(e as Error).message}`);
+      const msg = (e as Error).message;
+      if (msg.includes('Snapshot limit')) {
+        console.error('\n✗ Snapshot limit reached (5/5).');
+        console.error('  Delete one first:  clawon delete <id>');
+        console.error('  Delete oldest:     clawon delete --oldest');
+        console.error('  List snapshots:    clawon list');
+      } else {
+        console.error(`\n✗ Backup failed: ${msg}`);
+      }
       process.exit(1);
     }
   });
@@ -344,6 +352,12 @@ program
       }
       console.log('');
 
+      // Mark snapshot as applied + log restore event
+      await api(cfg.apiBaseUrl, '/api/v1/snapshots/restore', 'POST', cfg.apiKey, {
+        profileId: cfg.profileId,
+        snapshotId: snapshot.id,
+      });
+
       console.log('\n✓ Restore complete!');
       console.log(`  Restored to: ${OPENCLAW_DIR}`);
       console.log(`  Files: ${files.length}`);
@@ -395,6 +409,135 @@ program
       console.log(`\nTotal: ${snapshots.length} backup(s)`);
     } catch (e) {
       console.error(`✗ Failed to list backups: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawon activity
+// ─────────────────────────────────────────────────────────────
+
+const ACTIVITY_LABELS: Record<string, string> = {
+  BACKUP_CREATED: 'Backup created',
+  SNAPSHOT_CREATED: 'Snapshot created',
+  SNAPSHOT_DELETED: 'Snapshot deleted',
+  SNAPSHOT_RESTORED: 'Snapshot restored',
+  BACKUP_DOWNLOADED: 'Backup downloaded',
+  CONNECTED: 'Connected',
+  DISCONNECTED: 'Disconnected',
+};
+
+function formatEventLabel(type: string): string {
+  return ACTIVITY_LABELS[type] || type.replace(/_/g, ' ').toLowerCase().replace(/^\w/, c => c.toUpperCase());
+}
+
+function formatEventDetails(payload: any): string {
+  if (!payload || typeof payload !== 'object') return '';
+  const parts: string[] = [];
+  if (payload.fileCount != null || payload.changedFilesCount != null) {
+    parts.push(`${payload.fileCount ?? payload.changedFilesCount} files`);
+  }
+  if (payload.snapshotId) {
+    parts.push(payload.snapshotId);
+  }
+  if (payload.instanceName) {
+    parts.push(payload.instanceName);
+  }
+  return parts.join(' · ');
+}
+
+program
+  .command('activity')
+  .description('Show recent activity')
+  .option('--limit <n>', 'Number of events to show', '10')
+  .action(async (opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { events } = await api(
+        cfg.apiBaseUrl,
+        `/api/v1/events/list?profileId=${cfg.profileId}&limit=${opts.limit}`,
+        'GET',
+        cfg.apiKey
+      );
+
+      if (!events?.length) {
+        console.log('No activity yet. Run: clawon backup');
+        return;
+      }
+
+      console.log('Recent activity:\n');
+      console.log('Date                 | Event              | Details');
+      console.log('─'.repeat(80));
+
+      for (const ev of events) {
+        const date = new Date(ev.created_at).toLocaleString();
+        const label = formatEventLabel(ev.type);
+        const details = formatEventDetails(ev.payload);
+        console.log(`${date.padEnd(20)} | ${label.padEnd(18)} | ${details}`);
+      }
+    } catch (e) {
+      console.error(`✗ Failed to load activity: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawon delete
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('delete [id]')
+  .description('Delete a snapshot')
+  .option('--oldest', 'Delete the oldest ready snapshot')
+  .action(async (id, opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    if (!id && !opts.oldest) {
+      console.error('✗ Provide a snapshot ID or use --oldest');
+      console.error('  Usage:  clawon delete <id>');
+      console.error('          clawon delete --oldest');
+      process.exit(1);
+    }
+
+    try {
+      let snapshotId = id;
+
+      if (opts.oldest) {
+        const { snapshots } = await api(
+          cfg.apiBaseUrl,
+          `/api/v1/snapshots/list?profileId=${cfg.profileId}&limit=50`,
+          'GET',
+          cfg.apiKey
+        );
+
+        const readySnapshots = (snapshots || []).filter((s: any) => s.status === 'ready');
+        if (readySnapshots.length === 0) {
+          console.error('✗ No ready snapshots to delete');
+          process.exit(1);
+        }
+
+        // Oldest = last in the list (sorted newest-first)
+        snapshotId = readySnapshots[readySnapshots.length - 1].id;
+        console.log(`Oldest ready snapshot: ${snapshotId}`);
+      }
+
+      await api(cfg.apiBaseUrl, '/api/v1/snapshots/delete', 'POST', cfg.apiKey, {
+        profileId: cfg.profileId,
+        snapshotId,
+      });
+
+      console.log(`✓ Deleted snapshot ${snapshotId}`);
+    } catch (e) {
+      console.error(`✗ Delete failed: ${(e as Error).message}`);
       process.exit(1);
     }
   });
