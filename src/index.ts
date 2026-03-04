@@ -275,7 +275,7 @@ program
     } catch (e) {
       const msg = (e as Error).message;
       if (msg.includes('Snapshot limit')) {
-        console.error('\n✗ Snapshot limit reached (5/5).');
+        console.error('\n✗ Snapshot limit reached (2).');
         console.error('  Delete one first:  clawon delete <id>');
         console.error('  Delete oldest:     clawon delete --oldest');
         console.error('  List snapshots:    clawon list');
