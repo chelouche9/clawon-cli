@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import zlib from 'node:zlib';
 
 // ─────────────────────────────────────────────────────────────
 // Config
@@ -11,6 +12,7 @@ import os from 'node:os';
 const CONFIG_DIR = path.join(os.homedir(), '.clawon');
 const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const OPENCLAW_DIR = path.join(os.homedir(), '.openclaw');
+const BACKUPS_DIR = path.join(CONFIG_DIR, 'backups');
 
 type ClawonConfig = {
   apiKey: string;
@@ -137,6 +139,55 @@ function discoverFiles(baseDir: string): FileInfo[] {
 
   walk(baseDir);
   return files;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Local Archive Helpers
+// ─────────────────────────────────────────────────────────────
+
+type ArchiveFile = { path: string; size: number; content: string };
+type Archive = { version: number; created: string; files: ArchiveFile[] };
+
+function createLocalArchive(files: FileInfo[], openclawDir: string): Buffer {
+  const archiveFiles: ArchiveFile[] = files.map((f) => {
+    const fullPath = path.join(openclawDir, f.path);
+    const content = fs.readFileSync(fullPath).toString('base64');
+    return { path: f.path, size: f.size, content };
+  });
+
+  const archive: Archive = {
+    version: 1,
+    created: new Date().toISOString(),
+    files: archiveFiles,
+  };
+
+  return zlib.gzipSync(JSON.stringify(archive));
+}
+
+function extractLocalArchive(archivePath: string): { created: string; files: ArchiveFile[] } {
+  const compressed = fs.readFileSync(archivePath);
+  const json = zlib.gunzipSync(compressed).toString('utf8');
+  const archive: Archive = JSON.parse(json);
+  return { created: archive.created, files: archive.files };
+}
+
+// ─────────────────────────────────────────────────────────────
+// PostHog Tracking
+// ─────────────────────────────────────────────────────────────
+
+const POSTHOG_KEY = 'phc_LGJC4ZrED6EiK0sC1fusErOhR6gHlFCS5Qs7ou93SmV';
+
+function trackCliEvent(distinctId: string, event: string, properties: Record<string, unknown> = {}) {
+  fetch('https://us.i.posthog.com/capture/', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      api_key: POSTHOG_KEY,
+      distinct_id: distinctId,
+      event,
+      properties: { ...properties, source: 'cli' },
+    }),
+  }).catch(() => {});
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -272,6 +323,11 @@ program
       console.log(`  Snapshot ID: ${snapshotId}`);
       console.log(`  Files: ${files.length}`);
       console.log(`  Size: ${(totalSize / 1024).toFixed(1)} KB`);
+
+      trackCliEvent(cfg.profileId, 'cloud_backup_created', {
+        file_count: files.length,
+        total_bytes: totalSize,
+      });
     } catch (e) {
       const msg = (e as Error).message;
       if (msg.includes('Snapshot limit')) {
@@ -361,6 +417,10 @@ program
       console.log('\n✓ Restore complete!');
       console.log(`  Restored to: ${OPENCLAW_DIR}`);
       console.log(`  Files: ${files.length}`);
+
+      trackCliEvent(cfg.profileId, 'cloud_backup_restored', {
+        file_count: files.length,
+      });
     } catch (e) {
       console.error(`\n✗ Restore failed: ${(e as Error).message}`);
       process.exit(1);
@@ -591,6 +651,175 @@ program
       console.log(`\nTotal: ${files.length} files`);
     } catch (e) {
       console.error(`✗ Failed to list files: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawon local (backup / list / restore)
+// ─────────────────────────────────────────────────────────────
+
+const local = program
+  .command('local')
+  .description('Local backup and restore (no cloud required)');
+
+local
+  .command('backup')
+  .description('Save a local backup of your OpenClaw workspace')
+  .action(async () => {
+    if (!fs.existsSync(OPENCLAW_DIR)) {
+      console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
+      process.exit(1);
+    }
+
+    console.log('Discovering files...');
+    const files = discoverFiles(OPENCLAW_DIR);
+
+    if (files.length === 0) {
+      console.error('✗ No files found to backup');
+      process.exit(1);
+    }
+
+    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+    console.log(`Found ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
+
+    console.log('Creating archive...');
+    const archive = createLocalArchive(files, OPENCLAW_DIR);
+
+    ensureDir(BACKUPS_DIR);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', 'T').slice(0, 15);
+    const filename = `backup-${timestamp}.tar.gz`;
+    const filePath = path.join(BACKUPS_DIR, filename);
+    fs.writeFileSync(filePath, archive);
+
+    console.log(`\n✓ Local backup saved!`);
+    console.log(`  File: ${filePath}`);
+    console.log(`  Files: ${files.length}`);
+    console.log(`  Size: ${(archive.length / 1024).toFixed(1)} KB (compressed)`);
+
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_created', {
+      file_count: files.length,
+      total_bytes: totalSize,
+    });
+  });
+
+local
+  .command('list')
+  .description('List local backups')
+  .action(async () => {
+    if (!fs.existsSync(BACKUPS_DIR)) {
+      console.log('No local backups yet. Run: clawon local backup');
+      return;
+    }
+
+    const entries = fs.readdirSync(BACKUPS_DIR)
+      .filter((f) => f.endsWith('.tar.gz'))
+      .sort()
+      .reverse();
+
+    if (entries.length === 0) {
+      console.log('No local backups yet. Run: clawon local backup');
+      return;
+    }
+
+    console.log('Local backups:\n');
+    console.log('#  | Date                      | Files | Size     | Path');
+    console.log('─'.repeat(100));
+
+    for (let i = 0; i < entries.length; i++) {
+      const filePath = path.join(BACKUPS_DIR, entries[i]);
+      try {
+        const { created, files } = extractLocalArchive(filePath);
+        const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+        const date = new Date(created).toLocaleString();
+        console.log(
+          `${String(i + 1).padStart(2)} | ${date.padEnd(25)} | ${String(files.length).padEnd(5)} | ${(totalSize / 1024).toFixed(1).padEnd(8)} KB | ${filePath}`
+        );
+      } catch {
+        console.log(`${String(i + 1).padStart(2)} | ${entries[i].padEnd(25)} | ???   | ???        | ${filePath}`);
+      }
+    }
+
+    console.log(`\nTotal: ${entries.length} backup(s)`);
+    console.log(`\nRestore a backup:`);
+    console.log(`  clawon local restore              Restore the latest backup (#1)`);
+    console.log(`  clawon local restore --pick 2     Restore backup #2 from this list`);
+    console.log(`  clawon local restore --file <path> Restore from an external file`);
+  });
+
+local
+  .command('restore')
+  .description('Restore from a local backup')
+  .option('--file <path>', 'Path to an external backup file')
+  .option('--pick <n>', 'Restore backup #n from "clawon local list"')
+  .action(async (opts) => {
+    let archivePath: string;
+
+    if (opts.file) {
+      archivePath = path.resolve(opts.file);
+      if (!fs.existsSync(archivePath)) {
+        console.error(`✗ File not found: ${archivePath}`);
+        process.exit(1);
+      }
+    } else {
+      if (!fs.existsSync(BACKUPS_DIR)) {
+        console.error('✗ No local backups found. Run: clawon local backup');
+        process.exit(1);
+      }
+
+      const entries = fs.readdirSync(BACKUPS_DIR)
+        .filter((f) => f.endsWith('.tar.gz'))
+        .sort()
+        .reverse();
+
+      if (entries.length === 0) {
+        console.error('✗ No local backups found. Run: clawon local backup');
+        process.exit(1);
+      }
+
+      if (opts.pick) {
+        const idx = parseInt(opts.pick, 10) - 1;
+        if (isNaN(idx) || idx < 0 || idx >= entries.length) {
+          console.error(`✗ Invalid pick: #${opts.pick}. Run "clawon local list" to see available backups (1-${entries.length}).`);
+          process.exit(1);
+        }
+        archivePath = path.join(BACKUPS_DIR, entries[idx]);
+      } else {
+        archivePath = path.join(BACKUPS_DIR, entries[0]);
+      }
+    }
+
+    console.log(`Restoring from: ${archivePath}`);
+
+    try {
+      const { created, files } = extractLocalArchive(archivePath);
+      const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+
+      console.log(`Backup date: ${new Date(created).toLocaleString()}`);
+      console.log(`Files: ${files.length} (${(totalSize / 1024).toFixed(1)} KB)`);
+
+      let restored = 0;
+      for (const file of files) {
+        const targetPath = path.join(OPENCLAW_DIR, file.path);
+        ensureDir(path.dirname(targetPath));
+        fs.writeFileSync(targetPath, Buffer.from(file.content, 'base64'));
+        restored++;
+        process.stdout.write(`\r  Restored: ${restored}/${files.length}`);
+      }
+      console.log('');
+
+      console.log(`\n✓ Restore complete!`);
+      console.log(`  Restored to: ${OPENCLAW_DIR}`);
+      console.log(`  Files: ${files.length}`);
+
+      const cfg = readConfig();
+      trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_restored', {
+        file_count: files.length,
+        source: opts.file ? 'file' : 'local',
+      });
+    } catch (e) {
+      console.error(`\n✗ Restore failed: ${(e as Error).message}`);
       process.exit(1);
     }
   });

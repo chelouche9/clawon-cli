@@ -1,6 +1,6 @@
 {
   "name": "clawon",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "description": "Backup and restore your OpenClaw workspace",
   "type": "module",
   "bin": {
@@ -15,7 +15,13 @@
     "prepublishOnly": "npm run build",
     "start": "tsx src/index.ts"
   },
-  "keywords": ["openclaw", "clawon", "backup", "restore", "cli"],
+  "keywords": [
+    "openclaw",
+    "clawon",
+    "backup",
+    "restore",
+    "cli"
+  ],
   "license": "MIT",
   "dependencies": {
     "commander": "^12.1.0"
