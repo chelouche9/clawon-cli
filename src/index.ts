@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import zlib from 'node:zlib';
+import * as tar from 'tar';
 
 // ─────────────────────────────────────────────────────────────
 // Config
@@ -81,6 +81,7 @@ const INCLUDE_PATTERNS = [
 
 const EXCLUDE_PATTERNS = [
   'credentials/**',
+  'openclaw.json',
   'agents/*/sessions/**',
   'memory/lancedb/**',
   'memory/*.sqlite',
@@ -145,30 +146,56 @@ function discoverFiles(baseDir: string): FileInfo[] {
 // Local Archive Helpers
 // ─────────────────────────────────────────────────────────────
 
-type ArchiveFile = { path: string; size: number; content: string };
-type Archive = { version: number; created: string; files: ArchiveFile[] };
+type ClawonMeta = { version: number; created: string; tag?: string; file_count: number };
 
-function createLocalArchive(files: FileInfo[], openclawDir: string): Buffer {
-  const archiveFiles: ArchiveFile[] = files.map((f) => {
-    const fullPath = path.join(openclawDir, f.path);
-    const content = fs.readFileSync(fullPath).toString('base64');
-    return { path: f.path, size: f.size, content };
-  });
-
-  const archive: Archive = {
-    version: 1,
+async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string): Promise<void> {
+  // Write metadata file temporarily
+  const meta: ClawonMeta = {
+    version: 2,
     created: new Date().toISOString(),
-    files: archiveFiles,
+    ...(tag ? { tag } : {}),
+    file_count: files.length,
   };
+  const metaPath = path.join(openclawDir, '_clawon_meta.json');
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
 
-  return zlib.gzipSync(JSON.stringify(archive));
+  try {
+    await tar.create(
+      { gzip: true, file: outputPath, cwd: openclawDir },
+      ['_clawon_meta.json', ...files.map((f) => f.path)]
+    );
+  } finally {
+    fs.unlinkSync(metaPath);
+  }
 }
 
-function extractLocalArchive(archivePath: string): { created: string; files: ArchiveFile[] } {
-  const compressed = fs.readFileSync(archivePath);
-  const json = zlib.gunzipSync(compressed).toString('utf8');
-  const archive: Archive = JSON.parse(json);
-  return { created: archive.created, files: archive.files };
+async function readArchiveMeta(archivePath: string): Promise<ClawonMeta> {
+  let meta: ClawonMeta | null = null;
+
+  await tar.list({
+    file: archivePath,
+    onReadEntry: (entry) => {
+      if (entry.path === '_clawon_meta.json') {
+        const chunks: Buffer[] = [];
+        entry.on('data', (c: Buffer) => chunks.push(c));
+        entry.on('end', () => {
+          meta = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        });
+      }
+    },
+  });
+
+  if (!meta) throw new Error('Invalid archive: missing _clawon_meta.json');
+  return meta;
+}
+
+async function extractLocalArchive(archivePath: string, targetDir: string): Promise<ClawonMeta> {
+  const meta = await readArchiveMeta(archivePath);
+
+  ensureDir(targetDir);
+  await tar.extract({ file: archivePath, cwd: targetDir, filter: (p) => p !== '_clawon_meta.json' });
+
+  return meta;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -177,7 +204,12 @@ function extractLocalArchive(archivePath: string): { created: string; files: Arc
 
 const POSTHOG_KEY = 'phc_LGJC4ZrED6EiK0sC1fusErOhR6gHlFCS5Qs7ou93SmV';
 
+function telemetryDisabled(): boolean {
+  return process.env.DO_NOT_TRACK === '1' || process.env.CLAWON_NO_TELEMETRY === '1';
+}
+
 function trackCliEvent(distinctId: string, event: string, properties: Record<string, unknown> = {}) {
+  if (telemetryDisabled()) return;
   fetch('https://us.i.posthog.com/capture/', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -223,6 +255,8 @@ program
 
       console.log('✓ Logged in');
       console.log(`  Profile ID: ${connectJson.profileId}`);
+
+      trackCliEvent(connectJson.profileId, 'cli_login');
     } catch (e) {
       console.error(`✗ Login failed: ${(e as Error).message}`);
       process.exit(1);
@@ -237,6 +271,7 @@ program
   .command('backup')
   .description('Backup your OpenClaw workspace to the cloud')
   .option('--dry-run', 'Show what would be backed up without uploading')
+  .option('--tag <label>', 'Add a label to this backup')
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
@@ -286,6 +321,7 @@ program
         {
           profileId: cfg.profileId,
           files: files.map(f => ({ path: f.path, size: f.size })),
+          ...(opts.tag ? { tag: opts.tag } : {}),
         }
       );
 
@@ -456,17 +492,20 @@ program
       }
 
       console.log('Your backups:\n');
-      console.log('ID                                   | Date                 | Files | Size');
-      console.log('─'.repeat(80));
+      console.log('ID                                   | Date                 | Files | Size     | Tag');
+      console.log('─'.repeat(100));
 
       for (const s of snapshots) {
         const date = new Date(s.created_at).toLocaleString();
         const size = s.size_bytes ? `${(s.size_bytes / 1024).toFixed(1)} KB` : 'N/A';
         const files = s.changed_files_count || 'N/A';
-        console.log(`${s.id} | ${date.padEnd(20)} | ${String(files).padEnd(5)} | ${size}`);
+        const tag = s.tag || '';
+        console.log(`${s.id} | ${date.padEnd(20)} | ${String(files).padEnd(5)} | ${String(size).padEnd(8)} | ${tag}`);
       }
 
       console.log(`\nTotal: ${snapshots.length} backup(s)`);
+
+      trackCliEvent(cfg.profileId, 'cli_list_viewed', { count: snapshots.length });
     } catch (e) {
       console.error(`✗ Failed to list backups: ${(e as Error).message}`);
       process.exit(1);
@@ -540,6 +579,8 @@ program
         const details = formatEventDetails(ev.payload);
         console.log(`${date.padEnd(20)} | ${label.padEnd(18)} | ${details}`);
       }
+
+      trackCliEvent(cfg.profileId, 'cli_activity_viewed');
     } catch (e) {
       console.error(`✗ Failed to load activity: ${(e as Error).message}`);
       process.exit(1);
@@ -596,10 +637,58 @@ program
       });
 
       console.log(`✓ Deleted snapshot ${snapshotId}`);
+
+      trackCliEvent(cfg.profileId, 'cloud_backup_deleted');
     } catch (e) {
       console.error(`✗ Delete failed: ${(e as Error).message}`);
       process.exit(1);
     }
+  });
+
+// ─────────────────────────────────────────────────────────────
+// clawon discover
+// ─────────────────────────────────────────────────────────────
+
+program
+  .command('discover')
+  .description('Preview which files would be included in a backup')
+  .action(async () => {
+    if (!fs.existsSync(OPENCLAW_DIR)) {
+      console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
+      process.exit(1);
+    }
+
+    const files = discoverFiles(OPENCLAW_DIR);
+
+    if (files.length === 0) {
+      console.log('No files matched the include patterns.');
+      return;
+    }
+
+    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+
+    // Group by directory
+    const tree: Record<string, FileInfo[]> = {};
+    for (const f of files) {
+      const dir = path.dirname(f.path);
+      if (!tree[dir]) tree[dir] = [];
+      tree[dir].push(f);
+    }
+
+    console.log(`Files that would be backed up:\n`);
+    for (const dir of Object.keys(tree).sort()) {
+      console.log(`📁 ${dir}/`);
+      for (const f of tree[dir]) {
+        const name = path.basename(f.path);
+        console.log(`   📄 ${name} (${f.size} bytes)`);
+      }
+    }
+
+    console.log(`\nTotal: ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
+    console.log(`Source: ${OPENCLAW_DIR}`);
+
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length });
   });
 
 // ─────────────────────────────────────────────────────────────
@@ -649,6 +738,8 @@ program
       }
 
       console.log(`\nTotal: ${files.length} files`);
+
+      trackCliEvent(cfg.profileId, 'cli_files_viewed', { file_count: files.length });
     } catch (e) {
       console.error(`✗ Failed to list files: ${(e as Error).message}`);
       process.exit(1);
@@ -666,7 +757,8 @@ const local = program
 local
   .command('backup')
   .description('Save a local backup of your OpenClaw workspace')
-  .action(async () => {
+  .option('--tag <label>', 'Add a label to this backup')
+  .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
       process.exit(1);
@@ -683,19 +775,20 @@ local
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
     console.log(`Found ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
 
-    console.log('Creating archive...');
-    const archive = createLocalArchive(files, OPENCLAW_DIR);
-
     ensureDir(BACKUPS_DIR);
     const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', 'T').slice(0, 15);
     const filename = `backup-${timestamp}.tar.gz`;
     const filePath = path.join(BACKUPS_DIR, filename);
-    fs.writeFileSync(filePath, archive);
 
+    console.log('Creating archive...');
+    await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag);
+
+    const archiveSize = fs.statSync(filePath).size;
     console.log(`\n✓ Local backup saved!`);
     console.log(`  File: ${filePath}`);
     console.log(`  Files: ${files.length}`);
-    console.log(`  Size: ${(archive.length / 1024).toFixed(1)} KB (compressed)`);
+    console.log(`  Size: ${(archiveSize / 1024).toFixed(1)} KB (compressed)`);
+    if (opts.tag) console.log(`  Tag: ${opts.tag}`);
 
     const cfg = readConfig();
     trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_created', {
@@ -724,24 +817,30 @@ local
     }
 
     console.log('Local backups:\n');
-    console.log('#  | Date                      | Files | Size     | Path');
-    console.log('─'.repeat(100));
+    console.log('#  | Date                      | Files | Size     | Tag                  | Path');
+    console.log('─'.repeat(120));
 
     for (let i = 0; i < entries.length; i++) {
       const filePath = path.join(BACKUPS_DIR, entries[i]);
       try {
-        const { created, files } = extractLocalArchive(filePath);
-        const totalSize = files.reduce((sum, f) => sum + f.size, 0);
-        const date = new Date(created).toLocaleString();
+        const meta = await readArchiveMeta(filePath);
+        const date = new Date(meta.created).toLocaleString();
+        const archiveSize = fs.statSync(filePath).size;
+        const sizeStr = `${(archiveSize / 1024).toFixed(1)} KB`;
+        const tagStr = (meta.tag || '').padEnd(20);
         console.log(
-          `${String(i + 1).padStart(2)} | ${date.padEnd(25)} | ${String(files.length).padEnd(5)} | ${(totalSize / 1024).toFixed(1).padEnd(8)} KB | ${filePath}`
+          `${String(i + 1).padStart(2)} | ${date.padEnd(25)} | ${String(meta.file_count).padEnd(5)} | ${sizeStr.padEnd(10)} | ${tagStr} | ${filePath}`
         );
       } catch {
-        console.log(`${String(i + 1).padStart(2)} | ${entries[i].padEnd(25)} | ???   | ???        | ${filePath}`);
+        console.log(`${String(i + 1).padStart(2)} | ${entries[i].padEnd(25)} | ???   | ???        |                      | ${filePath}`);
       }
     }
 
     console.log(`\nTotal: ${entries.length} backup(s)`);
+
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'local_list_viewed', { count: entries.length });
+
     console.log(`\nRestore a backup:`);
     console.log(`  clawon local restore              Restore the latest backup (#1)`);
     console.log(`  clawon local restore --pick 2     Restore backup #2 from this list`);
@@ -793,29 +892,21 @@ local
     console.log(`Restoring from: ${archivePath}`);
 
     try {
-      const { created, files } = extractLocalArchive(archivePath);
-      const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+      const meta = await readArchiveMeta(archivePath);
+      console.log(`Backup date: ${new Date(meta.created).toLocaleString()}`);
+      console.log(`Files: ${meta.file_count}`);
+      if (meta.tag) console.log(`Tag: ${meta.tag}`);
 
-      console.log(`Backup date: ${new Date(created).toLocaleString()}`);
-      console.log(`Files: ${files.length} (${(totalSize / 1024).toFixed(1)} KB)`);
-
-      let restored = 0;
-      for (const file of files) {
-        const targetPath = path.join(OPENCLAW_DIR, file.path);
-        ensureDir(path.dirname(targetPath));
-        fs.writeFileSync(targetPath, Buffer.from(file.content, 'base64'));
-        restored++;
-        process.stdout.write(`\r  Restored: ${restored}/${files.length}`);
-      }
-      console.log('');
+      console.log('\nExtracting...');
+      await extractLocalArchive(archivePath, OPENCLAW_DIR);
 
       console.log(`\n✓ Restore complete!`);
       console.log(`  Restored to: ${OPENCLAW_DIR}`);
-      console.log(`  Files: ${files.length}`);
+      console.log(`  Files: ${meta.file_count}`);
 
       const cfg = readConfig();
       trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_restored', {
-        file_count: files.length,
+        file_count: meta.file_count,
         source: opts.file ? 'file' : 'local',
       });
     } catch (e) {
@@ -854,6 +945,8 @@ program
     } else {
       console.log(`✗ OpenClaw not found: ${OPENCLAW_DIR}`);
     }
+
+    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_status_viewed');
   });
 
 // ─────────────────────────────────────────────────────────────
@@ -864,9 +957,11 @@ program
   .command('logout')
   .description('Remove local credentials')
   .action(() => {
+    const cfg = readConfig();
     if (fs.existsSync(CONFIG_PATH)) {
       fs.unlinkSync(CONFIG_PATH);
       console.log('✓ Logged out');
+      trackCliEvent(cfg?.profileId || 'anonymous', 'cli_logout');
     } else {
       console.log('Already logged out');
     }
