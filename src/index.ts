@@ -103,7 +103,11 @@ function matchGlob(filePath: string, pattern: string): boolean {
   return new RegExp(`^${regexPattern}$`).test(filePath);
 }
 
-function shouldInclude(relativePath: string): boolean {
+function shouldInclude(relativePath: string, includeMemoryDb: boolean = false): boolean {
+  // Allow memory DB files through when flag is set
+  if (includeMemoryDb && matchGlob(relativePath, 'memory/*.sqlite')) {
+    return true;
+  }
   for (const pattern of EXCLUDE_PATTERNS) {
     if (matchGlob(relativePath, pattern)) return false;
   }
@@ -113,7 +117,7 @@ function shouldInclude(relativePath: string): boolean {
   return false;
 }
 
-function discoverFiles(baseDir: string): FileInfo[] {
+function discoverFiles(baseDir: string, includeMemoryDb: boolean = false): FileInfo[] {
   const files: FileInfo[] = [];
 
   function walk(dir: string, relativePath: string = '') {
@@ -127,7 +131,7 @@ function discoverFiles(baseDir: string): FileInfo[] {
       if (entry.isDirectory()) {
         walk(fullPath, relPath);
       } else if (entry.isFile()) {
-        if (shouldInclude(relPath)) {
+        if (shouldInclude(relPath, includeMemoryDb)) {
           const stats = fs.statSync(fullPath);
           files.push({
             path: relPath,
@@ -146,15 +150,16 @@ function discoverFiles(baseDir: string): FileInfo[] {
 // Local Archive Helpers
 // ─────────────────────────────────────────────────────────────
 
-type ClawonMeta = { version: number; created: string; tag?: string; file_count: number };
+type ClawonMeta = { version: number; created: string; tag?: string; file_count: number; include_memory_db?: boolean };
 
-async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string): Promise<void> {
+async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string, includeMemoryDb?: boolean): Promise<void> {
   // Write metadata file temporarily
   const meta: ClawonMeta = {
     version: 2,
     created: new Date().toISOString(),
     ...(tag ? { tag } : {}),
     file_count: files.length,
+    ...(includeMemoryDb ? { include_memory_db: true } : {}),
   };
   const metaPath = path.join(openclawDir, '_clawon_meta.json');
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
@@ -272,7 +277,12 @@ program
   .description('Backup your OpenClaw workspace to the cloud')
   .option('--dry-run', 'Show what would be backed up without uploading')
   .option('--tag <label>', 'Add a label to this backup')
+  .option('--include-memory-db', 'Include SQLite memory index')
   .action(async (opts) => {
+    if (opts.includeMemoryDb) {
+      console.error('✗ Memory DB backup requires a Pro account. Use `clawon local backup --include-memory-db` for local backups.');
+      process.exit(1);
+    }
     const cfg = readConfig();
     if (!cfg) {
       console.error('✗ Not logged in. Run: clawon login --api-key <key>');
@@ -363,6 +373,7 @@ program
       trackCliEvent(cfg.profileId, 'cloud_backup_created', {
         file_count: files.length,
         total_bytes: totalSize,
+        include_memory_db: !!opts.includeMemoryDb,
       });
     } catch (e) {
       const msg = (e as Error).message;
@@ -652,13 +663,14 @@ program
 program
   .command('discover')
   .description('Preview which files would be included in a backup')
-  .action(async () => {
+  .option('--include-memory-db', 'Include SQLite memory index')
+  .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
       process.exit(1);
     }
 
-    const files = discoverFiles(OPENCLAW_DIR);
+    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
 
     if (files.length === 0) {
       console.log('No files matched the include patterns.');
@@ -688,7 +700,7 @@ program
     console.log(`Source: ${OPENCLAW_DIR}`);
 
     const cfg = readConfig();
-    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length });
+    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length, include_memory_db: !!opts.includeMemoryDb });
   });
 
 // ─────────────────────────────────────────────────────────────
@@ -758,6 +770,7 @@ local
   .command('backup')
   .description('Save a local backup of your OpenClaw workspace')
   .option('--tag <label>', 'Add a label to this backup')
+  .option('--include-memory-db', 'Include SQLite memory index')
   .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
@@ -765,7 +778,7 @@ local
     }
 
     console.log('Discovering files...');
-    const files = discoverFiles(OPENCLAW_DIR);
+    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
 
     if (files.length === 0) {
       console.error('✗ No files found to backup');
@@ -781,7 +794,7 @@ local
     const filePath = path.join(BACKUPS_DIR, filename);
 
     console.log('Creating archive...');
-    await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag);
+    await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag, opts.includeMemoryDb);
 
     const archiveSize = fs.statSync(filePath).size;
     console.log(`\n✓ Local backup saved!`);
@@ -794,6 +807,7 @@ local
     trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_created', {
       file_count: files.length,
       total_bytes: totalSize,
+      include_memory_db: !!opts.includeMemoryDb,
     });
   });
 

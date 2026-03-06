@@ -21,6 +21,7 @@ Local backups are stored in `~/.clawon/backups/` as standard `.tar.gz` archives.
 # Create a backup
 npx clawon local backup
 npx clawon local backup --tag "before migration"
+npx clawon local backup --include-memory-db  # Include SQLite memory index
 
 # List all local backups
 npx clawon local list
@@ -43,6 +44,7 @@ npx clawon login --api-key <your-key>
 npx clawon backup
 npx clawon backup --tag "stable config"
 npx clawon backup --dry-run             # Preview without uploading
+npx clawon backup --include-memory-db   # Requires Pro account
 
 # List cloud backups
 npx clawon list
@@ -63,6 +65,7 @@ npx clawon activity                     # Recent events
 
 ```bash
 npx clawon discover    # Show exactly which files would be backed up
+npx clawon discover --include-memory-db  # Include SQLite memory index
 npx clawon status      # Connection status and file count
 npx clawon logout      # Remove local credentials
 ```
@@ -93,7 +96,7 @@ These are **always excluded**, even if they match an include pattern:
 | `openclaw.json` | May contain credentials |
 | `agents/*/sessions/**` | Ephemeral session data |
 | `memory/lancedb/**` | Vector database (binary, large) |
-| `memory/*.sqlite` | SQLite databases |
+| `memory/*.sqlite` | SQLite databases (use `--include-memory-db` to include) |
 | `*.lock`, `*.wal`, `*.shm` | Database lock files |
 | `node_modules/**` | Dependencies |
 
