@@ -3,6 +3,7 @@ import { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { execSync } from 'node:child_process';
 import * as tar from 'tar';
 
 // ─────────────────────────────────────────────────────────────
@@ -14,11 +15,22 @@ const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 const OPENCLAW_DIR = path.join(os.homedir(), '.openclaw');
 const BACKUPS_DIR = path.join(CONFIG_DIR, 'backups');
 
+type ScheduleConfig = {
+  enabled: boolean;
+  intervalHours: number;
+  maxSnapshots?: number | null;
+  includeMemoryDb?: boolean;
+};
+
 type ClawonConfig = {
-  apiKey: string;
-  profileId: string;
-  apiBaseUrl: string;
-  connectedAt: string;
+  apiKey?: string;
+  profileId?: string;
+  apiBaseUrl?: string;
+  connectedAt?: string;
+  schedule?: {
+    local?: ScheduleConfig;
+    cloud?: ScheduleConfig;
+  };
 };
 
 type FileInfo = {
@@ -39,6 +51,16 @@ function readConfig(): ClawonConfig | null {
 function writeConfig(cfg: ClawonConfig) {
   ensureDir(CONFIG_DIR);
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+function updateConfig(partial: Partial<ClawonConfig>) {
+  const existing = readConfig() || {};
+  const merged = { ...existing, ...partial };
+  if (partial.schedule) {
+    merged.schedule = { ...existing.schedule, ...partial.schedule };
+  }
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -77,11 +99,16 @@ const INCLUDE_PATTERNS = [
   'workspace/canvas/**',
   'skills/**',
   'agents/*/config.json',
+  'agents/*/models.json',
+  'agents/*/agent/**',
+  'cron/runs/*.jsonl',
 ];
 
 const EXCLUDE_PATTERNS = [
   'credentials/**',
   'openclaw.json',
+  'agents/*/auth.json',
+  'agents/*/auth-profiles.json',
   'agents/*/sessions/**',
   'memory/lancedb/**',
   'memory/*.sqlite',
@@ -150,9 +177,9 @@ function discoverFiles(baseDir: string, includeMemoryDb: boolean = false): FileI
 // Local Archive Helpers
 // ─────────────────────────────────────────────────────────────
 
-type ClawonMeta = { version: number; created: string; tag?: string; file_count: number; include_memory_db?: boolean };
+type ClawonMeta = { version: number; created: string; tag?: string; file_count: number; include_memory_db?: boolean; trigger?: 'manual' | 'scheduled' };
 
-async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string, includeMemoryDb?: boolean): Promise<void> {
+async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string, includeMemoryDb?: boolean, trigger?: 'manual' | 'scheduled'): Promise<void> {
   // Write metadata file temporarily
   const meta: ClawonMeta = {
     version: 2,
@@ -160,6 +187,7 @@ async function createLocalArchive(files: FileInfo[], openclawDir: string, output
     ...(tag ? { tag } : {}),
     file_count: files.length,
     ...(includeMemoryDb ? { include_memory_db: true } : {}),
+    ...(trigger ? { trigger } : {}),
   };
   const metaPath = path.join(openclawDir, '_clawon_meta.json');
   fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
@@ -228,6 +256,78 @@ function trackCliEvent(distinctId: string, event: string, properties: Record<str
 }
 
 // ─────────────────────────────────────────────────────────────
+// Crontab Helpers
+// ─────────────────────────────────────────────────────────────
+
+const CRON_MARKER_LOCAL = '# clawon-schedule-local';
+const CRON_MARKER_CLOUD = '# clawon-schedule-cloud';
+const SCHEDULE_LOG = path.join(CONFIG_DIR, 'schedule.log');
+
+const INTERVAL_CRON: Record<string, string> = {
+  '1h':  '0 * * * *',
+  '6h':  '0 */6 * * *',
+  '12h': '0 */12 * * *',
+  '24h': '0 0 * * *',
+};
+
+const VALID_INTERVALS = Object.keys(INTERVAL_CRON);
+
+function resolveCliCommand(args: string): string {
+  const nodePath = process.execPath;
+  const cliEntry = path.resolve(import.meta.dirname, 'index.js');
+  return `${nodePath} ${cliEntry} ${args}`;
+}
+
+function getCurrentCrontab(): string {
+  try {
+    return execSync('crontab -l 2>/dev/null', { encoding: 'utf8' });
+  } catch {
+    return '';
+  }
+}
+
+function setCrontab(content: string): void {
+  const tmpFile = path.join(CONFIG_DIR, '.crontab-tmp');
+  ensureDir(CONFIG_DIR);
+  fs.writeFileSync(tmpFile, content);
+  try {
+    execSync(`crontab ${tmpFile}`, { encoding: 'utf8' });
+  } finally {
+    fs.unlinkSync(tmpFile);
+  }
+}
+
+function addCronEntry(marker: string, cronExpr: string, command: string): void {
+  const current = getCurrentCrontab();
+  const filtered = current.split('\n').filter((line) => !line.includes(marker)).join('\n');
+  const entry = `${cronExpr} ${command} >> ${SCHEDULE_LOG} 2>&1 ${marker}`;
+  const updated = filtered.trim() ? `${filtered.trim()}\n${entry}\n` : `${entry}\n`;
+  setCrontab(updated);
+}
+
+function removeCronEntry(marker: string): boolean {
+  const current = getCurrentCrontab();
+  const lines = current.split('\n');
+  const filtered = lines.filter((line) => !line.includes(marker));
+  if (filtered.length === lines.length) return false;
+  setCrontab(filtered.join('\n'));
+  return true;
+}
+
+function getCronEntry(marker: string): string | null {
+  const current = getCurrentCrontab();
+  const line = current.split('\n').find((l) => l.includes(marker));
+  return line || null;
+}
+
+function assertNotWindows(): void {
+  if (process.platform === 'win32') {
+    console.error('✗ Scheduled backups require cron (macOS/Linux). Windows is not supported yet.');
+    process.exit(1);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // CLI Program
 // ─────────────────────────────────────────────────────────────
 
@@ -278,9 +378,10 @@ program
   .option('--dry-run', 'Show what would be backed up without uploading')
   .option('--tag <label>', 'Add a label to this backup')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
   .action(async (opts) => {
     if (opts.includeMemoryDb) {
-      console.error('✗ Memory DB backup requires a Pro account. Use `clawon local backup --include-memory-db` for local backups.');
+      console.error('✗ Memory DB cloud backup requires a Pro account. Use `clawon local backup --include-memory-db` for local backups.');
       process.exit(1);
     }
     const cfg = readConfig();
@@ -370,13 +471,18 @@ program
       console.log(`  Files: ${files.length}`);
       console.log(`  Size: ${(totalSize / 1024).toFixed(1)} KB`);
 
-      trackCliEvent(cfg.profileId, 'cloud_backup_created', {
+      trackCliEvent(cfg.profileId, opts.scheduled ? 'scheduled_backup_created' : 'cloud_backup_created', {
         file_count: files.length,
         total_bytes: totalSize,
         include_memory_db: !!opts.includeMemoryDb,
+        type: 'cloud',
+        trigger: opts.scheduled ? 'scheduled' : 'manual',
       });
     } catch (e) {
       const msg = (e as Error).message;
+      if (opts.scheduled) {
+        trackCliEvent(cfg.profileId, 'scheduled_backup_failed', { type: 'cloud', error: msg });
+      }
       if (msg.includes('Snapshot limit')) {
         console.error('\n✗ Snapshot limit reached (2).');
         console.error('  Delete one first:  clawon delete <id>');
@@ -704,6 +810,100 @@ program
   });
 
 // ─────────────────────────────────────────────────────────────
+// clawon schedule (cloud)
+// ─────────────────────────────────────────────────────────────
+
+const schedule = program
+  .command('schedule')
+  .description('Manage scheduled cloud backups');
+
+schedule
+  .command('on')
+  .description('Enable scheduled cloud backups via cron')
+  .option('--every <interval>', 'Backup interval: 1h, 6h, 12h, 24h', '12h')
+  .action(async (opts) => {
+    assertNotWindows();
+
+    // Gate: no tier exists yet
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'schedule_enabled_attempted', {
+      type: 'cloud',
+      interval_hours: parseInt(opts.every),
+      gated: true,
+    });
+    console.error('✗ Scheduled cloud backups require a Hobby or Pro account. Use `clawon local schedule on` for local scheduled backups.');
+    process.exit(1);
+  });
+
+schedule
+  .command('off')
+  .description('Disable scheduled cloud backups')
+  .action(async () => {
+    assertNotWindows();
+
+    const removed = removeCronEntry(CRON_MARKER_CLOUD);
+    if (!removed) {
+      console.log('No cloud schedule was active.');
+      return;
+    }
+
+    updateConfig({
+      schedule: {
+        cloud: { enabled: false, intervalHours: 0 },
+      },
+    });
+
+    console.log('✓ Scheduled cloud backup disabled');
+
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'schedule_disabled', { type: 'cloud' });
+  });
+
+schedule
+  .command('status')
+  .description('Show schedule status')
+  .action(async () => {
+    const cfg = readConfig();
+    const localEntry = getCronEntry(CRON_MARKER_LOCAL);
+    const cloudEntry = getCronEntry(CRON_MARKER_CLOUD);
+
+    console.log('Schedule Status\n');
+
+    if (localEntry) {
+      const localCfg = cfg?.schedule?.local;
+      console.log('✓ Local schedule: active');
+      if (localCfg?.intervalHours) console.log(`  Interval: every ${localCfg.intervalHours}h`);
+      if (localCfg?.maxSnapshots) console.log(`  Max snapshots: ${localCfg.maxSnapshots}`);
+      if (localCfg?.includeMemoryDb) console.log(`  Memory DB: included`);
+      console.log(`  Cron: ${localEntry.trim()}`);
+    } else {
+      console.log('✗ Local schedule: inactive');
+      console.log('  Enable: clawon local schedule on');
+    }
+
+    console.log('');
+
+    if (cloudEntry) {
+      const cloudCfg = cfg?.schedule?.cloud;
+      console.log('✓ Cloud schedule: active');
+      if (cloudCfg?.intervalHours) console.log(`  Interval: every ${cloudCfg.intervalHours}h`);
+      console.log(`  Cron: ${cloudEntry.trim()}`);
+    } else {
+      console.log('✗ Cloud schedule: inactive');
+      console.log('  Enable: clawon schedule on (requires Hobby or Pro)');
+    }
+
+    console.log(`\nLog: ${SCHEDULE_LOG}`);
+
+    trackCliEvent(cfg?.profileId || 'anonymous', 'schedule_status_viewed', {
+      local_enabled: !!localEntry,
+      cloud_enabled: !!cloudEntry,
+      local_interval_hours: cfg?.schedule?.local?.intervalHours || null,
+      cloud_interval_hours: cfg?.schedule?.cloud?.intervalHours || null,
+    });
+  });
+
+// ─────────────────────────────────────────────────────────────
 // clawon files
 // ─────────────────────────────────────────────────────────────
 
@@ -766,49 +966,184 @@ const local = program
   .command('local')
   .description('Local backup and restore (no cloud required)');
 
+// ── clawon local schedule ──
+
+const localSchedule = local
+  .command('schedule')
+  .description('Manage scheduled local backups');
+
+localSchedule
+  .command('on')
+  .description('Enable scheduled local backups via cron')
+  .option('--every <interval>', 'Backup interval: 1h, 6h, 12h, 24h', '12h')
+  .option('--max-snapshots <n>', 'Keep only the N most recent local backups')
+  .option('--include-memory-db', 'Include SQLite memory index')
+  .action(async (opts) => {
+    assertNotWindows();
+
+    const interval = opts.every;
+    if (!VALID_INTERVALS.includes(interval)) {
+      console.error(`✗ Invalid interval: ${interval}. Valid options: ${VALID_INTERVALS.join(', ')}`);
+      process.exit(1);
+    }
+
+    // Check existing state BEFORE writing config (for isUpdate detection)
+    const cfg = readConfig();
+    const wasEnabled = cfg?.schedule?.local?.enabled;
+
+    const cronExpr = INTERVAL_CRON[interval];
+    const args = 'local backup --scheduled' +
+      (opts.includeMemoryDb ? ' --include-memory-db' : '') +
+      (opts.maxSnapshots ? ` --max-snapshots ${opts.maxSnapshots}` : '');
+    const command = resolveCliCommand(args);
+
+    addCronEntry(CRON_MARKER_LOCAL, cronExpr, command);
+
+    // Persist to config
+    const maxSnapshots = opts.maxSnapshots ? parseInt(opts.maxSnapshots, 10) : null;
+    updateConfig({
+      schedule: {
+        local: {
+          enabled: true,
+          intervalHours: parseInt(interval),
+          ...(maxSnapshots ? { maxSnapshots } : {}),
+          ...(opts.includeMemoryDb ? { includeMemoryDb: true } : {}),
+        },
+      },
+    });
+
+    console.log(`✓ Scheduled local backup enabled`);
+    console.log(`  Interval: every ${interval}`);
+    if (maxSnapshots) console.log(`  Max snapshots: ${maxSnapshots}`);
+    if (opts.includeMemoryDb) console.log(`  Memory DB: included`);
+    console.log(`  Log: ${SCHEDULE_LOG}`);
+
+    // Run first backup immediately (without --scheduled so user sees output)
+    const firstRunArgs = 'local backup' +
+      (opts.includeMemoryDb ? ' --include-memory-db' : '') +
+      (opts.maxSnapshots ? ` --max-snapshots ${opts.maxSnapshots}` : '');
+    console.log('\nRunning first backup now...\n');
+    try {
+      execSync(resolveCliCommand(firstRunArgs), { stdio: 'inherit' });
+    } catch {
+      console.error('⚠ First backup failed — schedule is still active and will retry at next interval.');
+    }
+
+    trackCliEvent(cfg?.profileId || 'anonymous', wasEnabled ? 'schedule_updated' : 'schedule_enabled', {
+      type: 'local',
+      interval_hours: parseInt(interval),
+      max_snapshots: maxSnapshots,
+      include_memory_db: !!opts.includeMemoryDb,
+    });
+  });
+
+localSchedule
+  .command('off')
+  .description('Disable scheduled local backups')
+  .action(async () => {
+    assertNotWindows();
+
+    const removed = removeCronEntry(CRON_MARKER_LOCAL);
+    if (!removed) {
+      console.log('No local schedule was active.');
+      return;
+    }
+
+    updateConfig({
+      schedule: {
+        local: { enabled: false, intervalHours: 0 },
+      },
+    });
+
+    console.log('✓ Scheduled local backup disabled');
+
+    const cfg = readConfig();
+    trackCliEvent(cfg?.profileId || 'anonymous', 'schedule_disabled', { type: 'local' });
+  });
+
+// ── clawon local backup ──
+
 local
   .command('backup')
   .description('Save a local backup of your OpenClaw workspace')
   .option('--tag <label>', 'Add a label to this backup')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
+  .option('--max-snapshots <n>', 'Keep only the N most recent local backups')
   .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
       process.exit(1);
     }
 
-    console.log('Discovering files...');
-    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
+    try {
+      if (!opts.scheduled) console.log('Discovering files...');
+      const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
 
-    if (files.length === 0) {
-      console.error('✗ No files found to backup');
+      if (files.length === 0) {
+        console.error('✗ No files found to backup');
+        process.exit(1);
+      }
+
+      const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+      if (!opts.scheduled) console.log(`Found ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
+
+      ensureDir(BACKUPS_DIR);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', 'T').slice(0, 15);
+      const filename = `backup-${timestamp}.tar.gz`;
+      const filePath = path.join(BACKUPS_DIR, filename);
+
+      if (!opts.scheduled) console.log('Creating archive...');
+      await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag, opts.includeMemoryDb, opts.scheduled ? 'scheduled' : 'manual');
+
+      const archiveSize = fs.statSync(filePath).size;
+      if (!opts.scheduled) {
+        console.log(`\n✓ Local backup saved!`);
+        console.log(`  File: ${filePath}`);
+        console.log(`  Files: ${files.length}`);
+        console.log(`  Size: ${(archiveSize / 1024).toFixed(1)} KB (compressed)`);
+        if (opts.tag) console.log(`  Tag: ${opts.tag}`);
+      }
+
+      // Rotate old backups if --max-snapshots is set
+      const maxSnapshots = opts.maxSnapshots ? parseInt(opts.maxSnapshots, 10) : null;
+      let rotatedCount = 0;
+      if (maxSnapshots && maxSnapshots > 0) {
+        const allBackups = fs.readdirSync(BACKUPS_DIR)
+          .filter((f) => f.endsWith('.tar.gz'))
+          .sort()
+          .reverse(); // newest first
+
+        if (allBackups.length > maxSnapshots) {
+          const toDelete = allBackups.slice(maxSnapshots);
+          for (const old of toDelete) {
+            fs.unlinkSync(path.join(BACKUPS_DIR, old));
+            rotatedCount++;
+          }
+          if (!opts.scheduled) {
+            console.log(`  Rotated: deleted ${rotatedCount} old backup(s)`);
+          }
+        }
+      }
+
+      const cfg = readConfig();
+      trackCliEvent(cfg?.profileId || 'anonymous', opts.scheduled ? 'scheduled_backup_created' : 'local_backup_created', {
+        file_count: files.length,
+        total_bytes: totalSize,
+        include_memory_db: !!opts.includeMemoryDb,
+        type: 'local',
+        trigger: opts.scheduled ? 'scheduled' : 'manual',
+        rotated_count: rotatedCount,
+      });
+    } catch (e) {
+      const msg = (e as Error).message;
+      if (opts.scheduled) {
+        const cfg = readConfig();
+        trackCliEvent(cfg?.profileId || 'anonymous', 'scheduled_backup_failed', { type: 'local', error: msg });
+      }
+      console.error(`\n✗ Local backup failed: ${msg}`);
       process.exit(1);
     }
-
-    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
-    console.log(`Found ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
-
-    ensureDir(BACKUPS_DIR);
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '').replace('T', 'T').slice(0, 15);
-    const filename = `backup-${timestamp}.tar.gz`;
-    const filePath = path.join(BACKUPS_DIR, filename);
-
-    console.log('Creating archive...');
-    await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag, opts.includeMemoryDb);
-
-    const archiveSize = fs.statSync(filePath).size;
-    console.log(`\n✓ Local backup saved!`);
-    console.log(`  File: ${filePath}`);
-    console.log(`  Files: ${files.length}`);
-    console.log(`  Size: ${(archiveSize / 1024).toFixed(1)} KB (compressed)`);
-    if (opts.tag) console.log(`  Tag: ${opts.tag}`);
-
-    const cfg = readConfig();
-    trackCliEvent(cfg?.profileId || 'anonymous', 'local_backup_created', {
-      file_count: files.length,
-      total_bytes: totalSize,
-      include_memory_db: !!opts.includeMemoryDb,
-    });
   });
 
 local
@@ -958,6 +1293,18 @@ program
       console.log(`  Backupable files: ${files.length} (${(totalSize / 1024).toFixed(1)} KB)`);
     } else {
       console.log(`✗ OpenClaw not found: ${OPENCLAW_DIR}`);
+    }
+
+    console.log('');
+    const localEntry = getCronEntry(CRON_MARKER_LOCAL);
+    const cloudEntry = getCronEntry(CRON_MARKER_CLOUD);
+    if (localEntry || cloudEntry) {
+      console.log('✓ Schedule active');
+      if (localEntry) console.log('  Local: ' + (cfg?.schedule?.local?.intervalHours || '?') + 'h interval');
+      if (cloudEntry) console.log('  Cloud: ' + (cfg?.schedule?.cloud?.intervalHours || '?') + 'h interval');
+    } else {
+      console.log('✗ No schedule configured');
+      console.log('  Run: clawon local schedule on');
     }
 
     trackCliEvent(cfg?.profileId || 'anonymous', 'cli_status_viewed');

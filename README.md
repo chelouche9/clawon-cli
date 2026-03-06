@@ -22,6 +22,7 @@ Local backups are stored in `~/.clawon/backups/` as standard `.tar.gz` archives.
 npx clawon local backup
 npx clawon local backup --tag "before migration"
 npx clawon local backup --include-memory-db  # Include SQLite memory index
+npx clawon local backup --max-snapshots 10   # Keep only 10 most recent
 
 # List all local backups
 npx clawon local list
@@ -30,6 +31,27 @@ npx clawon local list
 npx clawon local restore                # Latest backup
 npx clawon local restore --pick 2       # Backup #2 from list
 npx clawon local restore --file path.tar.gz  # External file
+```
+
+### Scheduled Backups
+
+Set up automatic backups via cron (macOS/Linux only).
+
+```bash
+# Schedule local backups every 12 hours (default)
+npx clawon local schedule on
+npx clawon local schedule on --every 6h --max-snapshots 10
+npx clawon local schedule on --include-memory-db
+
+# Disable local schedule
+npx clawon local schedule off
+
+# Schedule cloud backups (requires Hobby or Pro account)
+npx clawon schedule on
+npx clawon schedule off
+
+# Check schedule status
+npx clawon schedule status
 ```
 
 ### Cloud Backups (requires account)
@@ -66,6 +88,7 @@ npx clawon activity                     # Recent events
 ```bash
 npx clawon discover    # Show exactly which files would be backed up
 npx clawon discover --include-memory-db  # Include SQLite memory index
+npx clawon schedule status  # Show active schedules
 npx clawon status      # Connection status and file count
 npx clawon logout      # Remove local credentials
 ```
@@ -83,6 +106,9 @@ Clawon uses an **allowlist** — only files matching these patterns are included
 | `workspace/canvas/**` | Canvas data |
 | `skills/**` | Top-level skills |
 | `agents/*/config.json` | Agent configurations |
+| `agents/*/models.json` | Model preferences |
+| `agents/*/agent/**` | Agent config data |
+| `cron/runs/*.jsonl` | Cron run logs |
 
 Run `npx clawon discover` to see the exact file list for your instance.
 
@@ -94,7 +120,9 @@ These are **always excluded**, even if they match an include pattern:
 |---------|-----|
 | `credentials/**` | API keys, tokens, auth files |
 | `openclaw.json` | May contain credentials |
-| `agents/*/sessions/**` | Ephemeral session data |
+| `agents/*/auth.json` | Authentication data |
+| `agents/*/auth-profiles.json` | Auth profiles |
+| `agents/*/sessions/**` | Chat history (large, use future `--include-sessions`) |
 | `memory/lancedb/**` | Vector database (binary, large) |
 | `memory/*.sqlite` | SQLite databases (use `--include-memory-db` to include) |
 | `*.lock`, `*.wal`, `*.shm` | Database lock files |
