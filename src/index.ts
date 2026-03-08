@@ -20,6 +20,7 @@ type ScheduleConfig = {
   intervalHours: number;
   maxSnapshots?: number | null;
   includeMemoryDb?: boolean;
+  includeSessions?: boolean;
 };
 
 type ClawonConfig = {
@@ -130,9 +131,13 @@ function matchGlob(filePath: string, pattern: string): boolean {
   return new RegExp(`^${regexPattern}$`).test(filePath);
 }
 
-function shouldInclude(relativePath: string, includeMemoryDb: boolean = false): boolean {
+function shouldInclude(relativePath: string, includeMemoryDb: boolean = false, includeSessions: boolean = false): boolean {
   // Allow memory DB files through when flag is set
   if (includeMemoryDb && matchGlob(relativePath, 'memory/*.sqlite')) {
+    return true;
+  }
+  // Allow session files through when flag is set
+  if (includeSessions && matchGlob(relativePath, 'agents/*/sessions/**')) {
     return true;
   }
   for (const pattern of EXCLUDE_PATTERNS) {
@@ -144,7 +149,7 @@ function shouldInclude(relativePath: string, includeMemoryDb: boolean = false): 
   return false;
 }
 
-function discoverFiles(baseDir: string, includeMemoryDb: boolean = false): FileInfo[] {
+function discoverFiles(baseDir: string, includeMemoryDb: boolean = false, includeSessions: boolean = false): FileInfo[] {
   const files: FileInfo[] = [];
 
   function walk(dir: string, relativePath: string = '') {
@@ -158,7 +163,7 @@ function discoverFiles(baseDir: string, includeMemoryDb: boolean = false): FileI
       if (entry.isDirectory()) {
         walk(fullPath, relPath);
       } else if (entry.isFile()) {
-        if (shouldInclude(relPath, includeMemoryDb)) {
+        if (shouldInclude(relPath, includeMemoryDb, includeSessions)) {
           const stats = fs.statSync(fullPath);
           files.push({
             path: relPath,
@@ -177,9 +182,9 @@ function discoverFiles(baseDir: string, includeMemoryDb: boolean = false): FileI
 // Local Archive Helpers
 // ─────────────────────────────────────────────────────────────
 
-type ClawonMeta = { version: number; created: string; tag?: string; file_count: number; include_memory_db?: boolean; trigger?: 'manual' | 'scheduled' };
+type ClawonMeta = { version: number; created: string; tag?: string; file_count: number; include_memory_db?: boolean; include_sessions?: boolean; trigger?: 'manual' | 'scheduled' };
 
-async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string, includeMemoryDb?: boolean, trigger?: 'manual' | 'scheduled'): Promise<void> {
+async function createLocalArchive(files: FileInfo[], openclawDir: string, outputPath: string, tag?: string, includeMemoryDb?: boolean, includeSessions?: boolean, trigger?: 'manual' | 'scheduled'): Promise<void> {
   // Write metadata file temporarily
   const meta: ClawonMeta = {
     version: 2,
@@ -187,6 +192,7 @@ async function createLocalArchive(files: FileInfo[], openclawDir: string, output
     ...(tag ? { tag } : {}),
     file_count: files.length,
     ...(includeMemoryDb ? { include_memory_db: true } : {}),
+    ...(includeSessions ? { include_sessions: true } : {}),
     ...(trigger ? { trigger } : {}),
   };
   const metaPath = path.join(openclawDir, '_clawon_meta.json');
@@ -341,18 +347,23 @@ program.name('clawon').description('Backup and restore your OpenClaw workspace')
 program
   .command('login')
   .description('Connect to Clawon with your API key')
-  .requiredOption('--api-key <key>', 'Your Clawon API key')
+  .option('--api-key <key>', 'Your Clawon API key (or set CLAWON_API_KEY env var)')
   .option('--api-url <url>', 'API base URL', 'https://clawon.io')
   .action(async (opts) => {
+    const apiKey = opts.apiKey || process.env.CLAWON_API_KEY;
+    if (!apiKey) {
+      console.error('✗ API key required. Use --api-key <key> or set CLAWON_API_KEY environment variable.');
+      process.exit(1);
+    }
     try {
-      const connectJson = await api(opts.apiUrl, '/api/v1/profile/connect', 'POST', opts.apiKey, {
+      const connectJson = await api(opts.apiUrl, '/api/v1/profile/connect', 'POST', apiKey, {
         profileName: 'default',
         instanceName: os.hostname(),
         syncIntervalMinutes: 60,
       });
 
       writeConfig({
-        apiKey: opts.apiKey,
+        apiKey: apiKey,
         profileId: connectJson.profileId,
         apiBaseUrl: opts.apiUrl,
         connectedAt: new Date().toISOString(),
@@ -378,10 +389,15 @@ program
   .option('--dry-run', 'Show what would be backed up without uploading')
   .option('--tag <label>', 'Add a label to this backup')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--include-sessions', 'Include chat history (sessions)')
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
   .action(async (opts) => {
     if (opts.includeMemoryDb) {
       console.error('✗ Memory DB cloud backup requires a Pro account. Use `clawon local backup --include-memory-db` for local backups.');
+      process.exit(1);
+    }
+    if (opts.includeSessions) {
+      console.error('✗ Session backup requires a Hobby or Pro account. Use `clawon local backup --include-sessions` for local backups.');
       process.exit(1);
     }
     const cfg = readConfig();
@@ -475,6 +491,7 @@ program
         file_count: files.length,
         total_bytes: totalSize,
         include_memory_db: !!opts.includeMemoryDb,
+        include_sessions: !!opts.includeSessions,
         type: 'cloud',
         trigger: opts.scheduled ? 'scheduled' : 'manual',
       });
@@ -770,13 +787,14 @@ program
   .command('discover')
   .description('Preview which files would be included in a backup')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--include-sessions', 'Include chat history (sessions)')
   .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
       process.exit(1);
     }
 
-    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
+    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
 
     if (files.length === 0) {
       console.log('No files matched the include patterns.');
@@ -806,7 +824,7 @@ program
     console.log(`Source: ${OPENCLAW_DIR}`);
 
     const cfg = readConfig();
-    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length, include_memory_db: !!opts.includeMemoryDb });
+    trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length, include_memory_db: !!opts.includeMemoryDb, include_sessions: !!opts.includeSessions });
   });
 
 // ─────────────────────────────────────────────────────────────
@@ -875,6 +893,7 @@ schedule
       if (localCfg?.intervalHours) console.log(`  Interval: every ${localCfg.intervalHours}h`);
       if (localCfg?.maxSnapshots) console.log(`  Max snapshots: ${localCfg.maxSnapshots}`);
       if (localCfg?.includeMemoryDb) console.log(`  Memory DB: included`);
+      if (localCfg?.includeSessions) console.log(`  Sessions: included`);
       console.log(`  Cron: ${localEntry.trim()}`);
     } else {
       console.log('✗ Local schedule: inactive');
@@ -978,6 +997,7 @@ localSchedule
   .option('--every <interval>', 'Backup interval: 1h, 6h, 12h, 24h', '12h')
   .option('--max-snapshots <n>', 'Keep only the N most recent local backups')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--include-sessions', 'Include chat history (sessions)')
   .action(async (opts) => {
     assertNotWindows();
 
@@ -994,6 +1014,7 @@ localSchedule
     const cronExpr = INTERVAL_CRON[interval];
     const args = 'local backup --scheduled' +
       (opts.includeMemoryDb ? ' --include-memory-db' : '') +
+      (opts.includeSessions ? ' --include-sessions' : '') +
       (opts.maxSnapshots ? ` --max-snapshots ${opts.maxSnapshots}` : '');
     const command = resolveCliCommand(args);
 
@@ -1008,6 +1029,7 @@ localSchedule
           intervalHours: parseInt(interval),
           ...(maxSnapshots ? { maxSnapshots } : {}),
           ...(opts.includeMemoryDb ? { includeMemoryDb: true } : {}),
+          ...(opts.includeSessions ? { includeSessions: true } : {}),
         },
       },
     });
@@ -1016,11 +1038,13 @@ localSchedule
     console.log(`  Interval: every ${interval}`);
     if (maxSnapshots) console.log(`  Max snapshots: ${maxSnapshots}`);
     if (opts.includeMemoryDb) console.log(`  Memory DB: included`);
+    if (opts.includeSessions) console.log(`  Sessions: included`);
     console.log(`  Log: ${SCHEDULE_LOG}`);
 
     // Run first backup immediately (without --scheduled so user sees output)
     const firstRunArgs = 'local backup' +
       (opts.includeMemoryDb ? ' --include-memory-db' : '') +
+      (opts.includeSessions ? ' --include-sessions' : '') +
       (opts.maxSnapshots ? ` --max-snapshots ${opts.maxSnapshots}` : '');
     console.log('\nRunning first backup now...\n');
     try {
@@ -1034,6 +1058,7 @@ localSchedule
       interval_hours: parseInt(interval),
       max_snapshots: maxSnapshots,
       include_memory_db: !!opts.includeMemoryDb,
+      include_sessions: !!opts.includeSessions,
     });
   });
 
@@ -1068,6 +1093,7 @@ local
   .description('Save a local backup of your OpenClaw workspace')
   .option('--tag <label>', 'Add a label to this backup')
   .option('--include-memory-db', 'Include SQLite memory index')
+  .option('--include-sessions', 'Include chat history (sessions)')
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
   .option('--max-snapshots <n>', 'Keep only the N most recent local backups')
   .action(async (opts) => {
@@ -1078,7 +1104,7 @@ local
 
     try {
       if (!opts.scheduled) console.log('Discovering files...');
-      const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb);
+      const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
 
       if (files.length === 0) {
         console.error('✗ No files found to backup');
@@ -1094,7 +1120,7 @@ local
       const filePath = path.join(BACKUPS_DIR, filename);
 
       if (!opts.scheduled) console.log('Creating archive...');
-      await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag, opts.includeMemoryDb, opts.scheduled ? 'scheduled' : 'manual');
+      await createLocalArchive(files, OPENCLAW_DIR, filePath, opts.tag, opts.includeMemoryDb, opts.includeSessions, opts.scheduled ? 'scheduled' : 'manual');
 
       const archiveSize = fs.statSync(filePath).size;
       if (!opts.scheduled) {
@@ -1131,6 +1157,7 @@ local
         file_count: files.length,
         total_bytes: totalSize,
         include_memory_db: !!opts.includeMemoryDb,
+        include_sessions: !!opts.includeSessions,
         type: 'local',
         trigger: opts.scheduled ? 'scheduled' : 'manual',
         rotated_count: rotatedCount,
