@@ -1,6 +1,6 @@
 {
   "name": "clawon",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Backup and restore your OpenClaw workspace",
   "type": "module",
   "bin": {
