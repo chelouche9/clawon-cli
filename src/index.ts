@@ -381,6 +381,7 @@ program
 
       trackCliEvent(connectJson.profileId, 'cli_login', {
         workspace_slug: connectJson.workspaceSlug,
+        workspace_count: connectJson.workspaceCount ?? 1,
       });
     } catch (e) {
       console.error(`✗ Login failed: ${(e as Error).message}`);
