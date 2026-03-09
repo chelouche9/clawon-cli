@@ -26,6 +26,8 @@ type ScheduleConfig = {
 type ClawonConfig = {
   apiKey?: string;
   profileId?: string;
+  workspaceId?: string;
+  workspaceSlug?: string;
   apiBaseUrl?: string;
   connectedAt?: string;
   schedule?: {
@@ -71,7 +73,7 @@ function updateConfig(partial: Partial<ClawonConfig>) {
 async function api(
   baseUrl: string,
   endpoint: string,
-  method: 'GET' | 'POST',
+  method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
   apiKey: string,
   body?: unknown
 ) {
@@ -365,14 +367,21 @@ program
       writeConfig({
         apiKey: apiKey,
         profileId: connectJson.profileId,
+        workspaceId: connectJson.workspaceId || undefined,
+        workspaceSlug: connectJson.workspaceSlug || undefined,
         apiBaseUrl: opts.apiUrl,
         connectedAt: new Date().toISOString(),
       });
 
       console.log('✓ Logged in');
       console.log(`  Profile ID: ${connectJson.profileId}`);
+      if (connectJson.workspaceSlug) {
+        console.log(`  Workspace: ${connectJson.workspaceSlug}`);
+      }
 
-      trackCliEvent(connectJson.profileId, 'cli_login');
+      trackCliEvent(connectJson.profileId, 'cli_login', {
+        workspace_slug: connectJson.workspaceSlug,
+      });
     } catch (e) {
       console.error(`✗ Login failed: ${(e as Error).message}`);
       process.exit(1);
@@ -393,7 +402,7 @@ program
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
   .action(async (opts) => {
     if (opts.includeMemoryDb) {
-      console.error('✗ Memory DB cloud backup requires a Pro account. Use `clawon local backup --include-memory-db` for local backups.');
+      console.error('✗ Memory DB cloud backup requires a Hobby or Pro account. Use `clawon local backup --include-memory-db` for local backups.');
       process.exit(1);
     }
     if (opts.includeSessions) {
@@ -403,6 +412,12 @@ program
     const cfg = readConfig();
     if (!cfg) {
       console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    if (!cfg.workspaceId) {
+      console.error('✗ No workspace selected. Run: clawon workspaces switch <slug>');
+      console.error('  Or re-login: clawon login --api-key <key>');
       process.exit(1);
     }
 
@@ -447,6 +462,7 @@ program
         cfg.apiKey,
         {
           profileId: cfg.profileId,
+          workspaceId: cfg.workspaceId,
           files: files.map(f => ({ path: f.path, size: f.size })),
           ...(opts.tag ? { tag: opts.tag } : {}),
         }
@@ -493,6 +509,7 @@ program
         include_memory_db: !!opts.includeMemoryDb,
         include_sessions: !!opts.includeSessions,
         type: 'cloud',
+        workspace_slug: cfg.workspaceSlug,
         trigger: opts.scheduled ? 'scheduled' : 'manual',
       });
     } catch (e) {
@@ -613,9 +630,10 @@ program
     }
 
     try {
+      const wsParam = cfg.workspaceId ? `&workspaceId=${cfg.workspaceId}` : '';
       const { snapshots } = await api(
         cfg.apiBaseUrl,
-        `/api/v1/snapshots/list?profileId=${cfg.profileId}&limit=${opts.limit}`,
+        `/api/v1/snapshots/list?profileId=${cfg.profileId}&limit=${opts.limit}${wsParam}`,
         'GET',
         cfg.apiKey
       );
@@ -625,6 +643,9 @@ program
         return;
       }
 
+      if (cfg.workspaceSlug) {
+        console.log(`Workspace: ${cfg.workspaceSlug}\n`);
+      }
       console.log('Your backups:\n');
       console.log('ID                                   | Date                 | Files | Size     | Tag');
       console.log('─'.repeat(100));
@@ -1292,6 +1313,182 @@ local
   });
 
 // ─────────────────────────────────────────────────────────────
+// clawon workspaces
+// ─────────────────────────────────────────────────────────────
+
+const workspaces = program
+  .command('workspaces')
+  .description('Manage workspaces');
+
+workspaces
+  .command('list')
+  .description('List your workspaces')
+  .action(async () => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { workspaces: wsList } = await api(
+        cfg.apiBaseUrl,
+        `/api/v1/workspaces/list?profileId=${cfg.profileId}`,
+        'GET',
+        cfg.apiKey
+      );
+
+      if (!wsList?.length) {
+        console.log('No workspaces yet.');
+        return;
+      }
+
+      console.log('Your workspaces:\n');
+      console.log('Name                 | Slug                 | Snapshots | Last Backup');
+      console.log('─'.repeat(80));
+
+      for (const ws of wsList) {
+        const lastBackup = ws.lastBackupAt ? new Date(ws.lastBackupAt).toLocaleString() : 'Never';
+        const current = ws.id === cfg.workspaceId ? ' ← current' : '';
+        console.log(
+          `${ws.name.padEnd(20)} | ${ws.slug.padEnd(20)} | ${String(ws.snapshotCount).padEnd(9)} | ${lastBackup}${current}`
+        );
+      }
+
+      console.log(`\nTotal: ${wsList.length} workspace(s)`);
+
+      trackCliEvent(cfg.profileId, 'cli_workspaces_listed', { count: wsList.length });
+    } catch (e) {
+      console.error(`✗ Failed to list workspaces: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+workspaces
+  .command('create <name>')
+  .description('Create a new workspace')
+  .option('--description <desc>', 'Workspace description')
+  .action(async (name, opts) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { workspace } = await api(
+        cfg.apiBaseUrl,
+        '/api/v1/workspaces/create',
+        'POST',
+        cfg.apiKey,
+        {
+          profileId: cfg.profileId,
+          name,
+          ...(opts.description ? { description: opts.description } : {}),
+        }
+      );
+
+      console.log(`✓ Workspace created`);
+      console.log(`  Name: ${workspace.name}`);
+      console.log(`  Slug: ${workspace.slug}`);
+      console.log(`\nSwitch to it: clawon workspaces switch ${workspace.slug}`);
+
+      trackCliEvent(cfg.profileId, 'workspace_created', { name, slug: workspace.slug });
+    } catch (e) {
+      console.error(`✗ Failed to create workspace: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+workspaces
+  .command('switch <slug>')
+  .description('Switch to a different workspace')
+  .action(async (slug) => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const { workspaces: wsList } = await api(
+        cfg.apiBaseUrl,
+        `/api/v1/workspaces/list?profileId=${cfg.profileId}`,
+        'GET',
+        cfg.apiKey
+      );
+
+      const target = (wsList || []).find((w: any) => w.slug === slug);
+      if (!target) {
+        console.error(`✗ Workspace "${slug}" not found.`);
+        console.error('  Available workspaces:');
+        for (const ws of wsList || []) {
+          console.error(`    • ${ws.slug}`);
+        }
+        process.exit(1);
+      }
+
+      const previousSlug = cfg.workspaceSlug;
+      updateConfig({ workspaceId: target.id, workspaceSlug: target.slug });
+
+      console.log(`✓ Switched to workspace: ${target.name} (${target.slug})`);
+
+      trackCliEvent(cfg.profileId, 'workspace_switched', {
+        from_slug: previousSlug,
+        to_slug: target.slug,
+      });
+    } catch (e) {
+      console.error(`✗ Failed to switch workspace: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+workspaces
+  .command('info')
+  .description('Show current workspace info')
+  .action(async () => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    if (!cfg.workspaceId) {
+      console.log('No workspace selected. Run: clawon workspaces switch <slug>');
+      return;
+    }
+
+    try {
+      const { workspaces: wsList } = await api(
+        cfg.apiBaseUrl,
+        `/api/v1/workspaces/list?profileId=${cfg.profileId}`,
+        'GET',
+        cfg.apiKey
+      );
+
+      const current = (wsList || []).find((w: any) => w.id === cfg.workspaceId);
+      if (!current) {
+        console.log('Current workspace not found on server. It may have been deleted.');
+        return;
+      }
+
+      console.log('Current Workspace\n');
+      console.log(`  Name: ${current.name}`);
+      console.log(`  Slug: ${current.slug}`);
+      console.log(`  Snapshots: ${current.snapshotCount}`);
+      if (current.lastBackupAt) {
+        console.log(`  Last backup: ${new Date(current.lastBackupAt).toLocaleString()}`);
+      }
+      if (current.description) {
+        console.log(`  Description: ${current.description}`);
+      }
+    } catch (e) {
+      console.error(`✗ Failed to get workspace info: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────
 // clawon status
 // ─────────────────────────────────────────────────────────────
 
@@ -1306,6 +1503,9 @@ program
     if (cfg) {
       console.log(`✓ Logged in`);
       console.log(`  Profile ID: ${cfg.profileId}`);
+      if (cfg.workspaceSlug) {
+        console.log(`  Workspace: ${cfg.workspaceSlug}`);
+      }
       console.log(`  API: ${cfg.apiBaseUrl}`);
     } else {
       console.log(`✗ Not logged in`);

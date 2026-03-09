@@ -56,9 +56,27 @@ npx clawon schedule off
 npx clawon schedule status
 ```
 
+### Workspaces
+
+Workspaces organize your cloud snapshots by machine or environment — like GitHub repos for your backups. A default workspace is created automatically on login.
+
+```bash
+# List your workspaces
+npx clawon workspaces list
+
+# Create a new workspace
+npx clawon workspaces create "Work Server"
+
+# Switch active workspace (affects backup/restore/list)
+npx clawon workspaces switch work-server
+
+# Show current workspace info
+npx clawon workspaces info
+```
+
 ### Cloud Backups (requires account)
 
-Cloud backups sync your workspace to Clawon's servers for cross-machine access.
+Cloud backups sync your workspace to Clawon's servers for cross-machine access. Snapshots are scoped to your current workspace.
 
 ```bash
 # Authenticate (env var recommended to avoid shell history)
@@ -72,7 +90,7 @@ npx clawon login --api-key <your-key>
 npx clawon backup
 npx clawon backup --tag "stable config"
 npx clawon backup --dry-run             # Preview without uploading
-npx clawon backup --include-memory-db   # Requires Pro account
+npx clawon backup --include-memory-db   # Requires Hobby or Pro
 npx clawon backup --include-sessions    # Requires Hobby or Pro
 
 # List cloud backups
@@ -97,7 +115,7 @@ npx clawon discover    # Show exactly which files would be backed up
 npx clawon discover --include-memory-db  # Include SQLite memory index
 npx clawon discover --include-sessions   # Include chat history
 npx clawon schedule status  # Show active schedules
-npx clawon status      # Connection status and file count
+npx clawon status      # Connection status, workspace, and file count
 npx clawon logout      # Remove local credentials
 ```
 
@@ -169,7 +187,7 @@ Each archive contains:
 
 ## Configuration
 
-Config is stored at `~/.clawon/config.json` after running `clawon login`. Contains your API key, profile ID, and API URL. Run `clawon logout` to remove it.
+Config is stored at `~/.clawon/config.json` after running `clawon login`. Contains your API key, profile ID, workspace, and API URL. Run `clawon logout` to remove it.
 
 ## Telemetry
 
