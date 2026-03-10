@@ -864,15 +864,60 @@ schedule
   .action(async (opts) => {
     assertNotWindows();
 
-    // Gate: no tier exists yet
     const cfg = readConfig();
-    trackCliEvent(cfg?.profileId || 'anonymous', 'schedule_enabled_attempted', {
-      type: 'cloud',
-      interval_hours: parseInt(opts.every),
-      gated: true,
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    const interval = opts.every;
+    if (!VALID_INTERVALS.includes(interval)) {
+      console.error(`✗ Invalid interval: ${interval}. Valid options: ${VALID_INTERVALS.join(', ')}`);
+      process.exit(1);
+    }
+
+    // Check tier — cloud schedules require Hobby or Pro
+    try {
+      const data = await api(
+        cfg.apiBaseUrl || 'https://clawon.io',
+        `/api/v1/profile/status?profileId=${cfg.profileId}`,
+        'GET',
+        cfg.apiKey!
+      );
+      const limits = data.tierLimits || {};
+      if (!limits.scheduledCloud) {
+        console.error('✗ Scheduled cloud backups require a Hobby or Pro plan.');
+        console.error('  Use `clawon local schedule on` for free local scheduled backups.');
+        console.error('  Upgrade at: https://clawon.io/dashboard/billing');
+        process.exit(1);
+      }
+    } catch (e) {
+      console.error(`✗ Failed to check plan: ${(e as Error).message}`);
+      process.exit(1);
+    }
+
+    const cronExpr = INTERVAL_CRON[interval];
+    const command = resolveCliCommand(`backup --scheduled`);
+
+    addCronEntry(CRON_MARKER_CLOUD, cronExpr, command);
+
+    updateConfig({
+      schedule: {
+        cloud: {
+          enabled: true,
+          intervalHours: parseInt(interval),
+        },
+      },
     });
-    console.error('✗ Scheduled cloud backups require a Hobby or Pro account. Use `clawon local schedule on` for local scheduled backups.');
-    process.exit(1);
+
+    console.log(`✓ Scheduled cloud backup enabled`);
+    console.log(`  Interval: every ${interval}`);
+    console.log(`  Log: ${SCHEDULE_LOG}`);
+
+    trackCliEvent(cfg.profileId, 'schedule_enabled', {
+      type: 'cloud',
+      interval_hours: parseInt(interval),
+    });
   });
 
 schedule
