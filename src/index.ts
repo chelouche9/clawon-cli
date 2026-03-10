@@ -86,7 +86,14 @@ async function api(
     body: body ? JSON.stringify(body) : undefined,
   });
   const json = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(json.error || json.message || `HTTP ${res.status}`);
+  if (!res.ok) {
+    if (json.upgradeRequired) {
+      console.error(`\n✗ ${json.error || 'This feature requires a paid plan.'}`);
+      console.error('  Upgrade at: https://clawon.io/dashboard/billing');
+      process.exit(1);
+    }
+    throw new Error(json.error || json.message || `HTTP ${res.status}`);
+  }
   return json;
 }
 
@@ -402,14 +409,6 @@ program
   .option('--include-sessions', 'Include chat history (sessions)')
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
   .action(async (opts) => {
-    if (opts.includeMemoryDb) {
-      console.error('✗ Memory DB cloud backup requires a Hobby or Pro account. Use `clawon local backup --include-memory-db` for local backups.');
-      process.exit(1);
-    }
-    if (opts.includeSessions) {
-      console.error('✗ Session backup requires a Hobby or Pro account. Use `clawon local backup --include-sessions` for local backups.');
-      process.exit(1);
-    }
     const cfg = readConfig();
     if (!cfg) {
       console.error('✗ Not logged in. Run: clawon login --api-key <key>');
@@ -428,7 +427,7 @@ program
     }
 
     console.log('Discovering files...');
-    const files = discoverFiles(OPENCLAW_DIR);
+    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
 
     if (files.length === 0) {
       console.error('✗ No files found to backup');
@@ -519,10 +518,11 @@ program
         trackCliEvent(cfg.profileId, 'scheduled_backup_failed', { type: 'cloud', error: msg });
       }
       if (msg.includes('Snapshot limit')) {
-        console.error('\n✗ Snapshot limit reached (2).');
+        console.error('\n✗ Snapshot limit reached.');
         console.error('  Delete one first:  clawon delete <id>');
         console.error('  Delete oldest:     clawon delete --oldest');
         console.error('  List snapshots:    clawon list');
+        console.error('  Upgrade plan:      https://clawon.io/dashboard/billing');
       } else {
         console.error(`\n✗ Backup failed: ${msg}`);
       }
@@ -1541,6 +1541,44 @@ program
 // ─────────────────────────────────────────────────────────────
 // clawon logout
 // ─────────────────────────────────────────────────────────────
+
+program
+  .command('plan')
+  .description('Show your current plan, limits, and usage')
+  .action(async () => {
+    const cfg = readConfig();
+    if (!cfg) {
+      console.error('✗ Not logged in. Run: clawon login --api-key <key>');
+      process.exit(1);
+    }
+
+    try {
+      const data = await api(
+        cfg.apiBaseUrl || 'https://clawon.io',
+        `/api/v1/profile/status?profileId=${cfg.profileId}${cfg.workspaceId ? `&workspaceId=${cfg.workspaceId}` : ''}`,
+        'GET',
+        cfg.apiKey!
+      );
+
+      const tier = data.tier || 'free';
+      const limits = data.tierLimits || {};
+      const label = limits.label || 'Starter';
+
+      console.log(`\n  Plan:          ${label} (${tier})`);
+      console.log(`  Snapshots:     ${limits.snapshotLimit || 2} per workspace`);
+      console.log(`  Workspaces:    ${limits.workspaceLimit || 1}`);
+      console.log(`  Max size:      ${limits.maxSizeMb || 50} MB`);
+      console.log(`  Memory DB:     ${limits.includeMemoryDb ? 'included' : 'not included (Hobby+)'}`);
+      console.log(`  Sessions:      ${limits.includeSessions ? 'included' : 'not included (Hobby+)'}`);
+      console.log(`  Cloud schedule: ${limits.scheduledCloud ? 'available' : 'not available (Hobby+)'}`);
+      console.log(`\n  Manage:        https://clawon.io/dashboard/billing\n`);
+
+      trackCliEvent(cfg.profileId, 'cli_plan_checked', { tier });
+    } catch (e) {
+      console.error(`✗ Failed to fetch plan: ${(e as Error).message}`);
+      process.exit(1);
+    }
+  });
 
 program
   .command('logout')
