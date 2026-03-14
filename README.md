@@ -23,6 +23,7 @@ npx clawon local backup
 npx clawon local backup --tag "before migration"
 npx clawon local backup --include-memory-db  # Include SQLite memory index
 npx clawon local backup --include-sessions   # Include chat history
+npx clawon local backup --no-secret-scan     # Skip secret scanning
 npx clawon local backup --max-snapshots 10   # Keep only 10 most recent
 
 # List all local backups
@@ -92,6 +93,7 @@ npx clawon backup --tag "stable config"
 npx clawon backup --dry-run             # Preview without uploading
 npx clawon backup --include-memory-db   # Requires Hobby or Pro
 npx clawon backup --include-sessions    # Requires Hobby or Pro
+npx clawon backup --no-secret-scan      # Skip secret scanning
 
 # List cloud backups
 npx clawon list
@@ -114,6 +116,7 @@ npx clawon activity                     # Recent events
 npx clawon discover    # Show exactly which files would be backed up
 npx clawon discover --include-memory-db  # Include SQLite memory index
 npx clawon discover --include-sessions   # Include chat history
+npx clawon discover --scan               # Scan for secrets in discovered files
 npx clawon schedule status  # Show active schedules
 npx clawon status      # Connection status, workspace, and file count
 npx clawon logout      # Remove local credentials
@@ -155,6 +158,25 @@ These are **always excluded**, even if they match an include pattern:
 | `node_modules/**` | Dependencies |
 
 **Credentials never leave your machine.** The entire `credentials/` directory and `openclaw.json` are excluded by default. You can verify this by running `npx clawon discover` before any backup.
+
+## Secret Scanning
+
+Every backup is pre-scanned for leaked secrets using **221 detection rules** ported from [gitleaks](https://github.com/gitleaks/gitleaks). This catches API keys, tokens, private keys, JWTs, and more — before they leave your machine.
+
+How it works: keyword pre-filtering narrows candidates, then regex matching and Shannon entropy checks confirm real secrets. No new dependencies — pure regex matching built into the CLI.
+
+When secrets are found during a manual backup, you'll see an interactive prompt:
+- `[s]` — **Skip** flagged files (default)
+- `[a]` — **Abort** the backup entirely
+- `[i]` — **Ignore** findings and back up anyway
+
+Scheduled backups automatically skip flagged files.
+
+```bash
+npx clawon discover --scan               # Preview secret findings without backing up
+npx clawon local backup --no-secret-scan  # Disable scanning for a backup
+npx clawon backup --no-secret-scan        # Same for cloud backups
+```
 
 ## Archive Format
 
