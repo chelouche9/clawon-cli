@@ -3,8 +3,10 @@ import { Command } from 'commander';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import readline from 'node:readline';
 import { execSync } from 'node:child_process';
 import * as tar from 'tar';
+import { scanFiles, formatFindings, type SecretFinding } from './scanner/index.js';
 
 // ─────────────────────────────────────────────────────────────
 // Config
@@ -271,6 +273,33 @@ function trackCliEvent(distinctId: string, event: string, properties: Record<str
 }
 
 // ─────────────────────────────────────────────────────────────
+// Secret Scanning Helpers
+// ─────────────────────────────────────────────────────────────
+
+type ScanAction = 'skip' | 'abort' | 'ignore';
+
+async function promptSecretAction(findings: SecretFinding[]): Promise<ScanAction> {
+  console.log(formatFindings(findings));
+
+  const flaggedFiles = [...new Set(findings.map(f => f.filePath))];
+  console.log(`  [s] Skip ${flaggedFiles.length} flagged file(s) and continue`);
+  console.log(`  [a] Abort backup`);
+  console.log(`  [i] Ignore warnings and backup all files`);
+  console.log('');
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise<ScanAction>((resolve) => {
+    rl.question('  Choice (s/a/i): ', (answer) => {
+      rl.close();
+      const choice = answer.trim().toLowerCase();
+      if (choice === 'a') resolve('abort');
+      else if (choice === 'i') resolve('ignore');
+      else resolve('skip'); // default
+    });
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 // Crontab Helpers
 // ─────────────────────────────────────────────────────────────
 
@@ -408,6 +437,7 @@ program
   .option('--include-memory-db', 'Include SQLite memory index')
   .option('--include-sessions', 'Include chat history (sessions)')
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
+  .option('--no-secret-scan', 'Skip secret scanning before backup')
   .action(async (opts) => {
     const cfg = readConfig();
     if (!cfg) {
@@ -427,11 +457,52 @@ program
     }
 
     console.log('Discovering files...');
-    const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
+    let files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
 
     if (files.length === 0) {
       console.error('✗ No files found to backup');
       process.exit(1);
+    }
+
+    // Secret scanning phase
+    let secretsFound = 0;
+    let secretsFilesSkipped = 0;
+    const scanSkipped = !opts.secretScan;
+
+    if (opts.secretScan) {
+      console.log('Scanning for secrets...');
+      const scanResult = await scanFiles(files, OPENCLAW_DIR);
+      secretsFound = scanResult.findings.length;
+
+      if (scanResult.findings.length > 0) {
+        const flaggedPaths = new Set(scanResult.findings.map(f => f.filePath));
+        secretsFilesSkipped = flaggedPaths.size;
+
+        if (opts.scheduled) {
+          // Scheduled mode: auto-skip flagged files
+          files = files.filter(f => !flaggedPaths.has(f.path));
+          console.error(`⚠ Secret scan: skipped ${flaggedPaths.size} file(s) with potential secrets`);
+        } else {
+          // Interactive mode: prompt user
+          const action = await promptSecretAction(scanResult.findings);
+          if (action === 'abort') {
+            console.log('Backup aborted.');
+            process.exit(0);
+          } else if (action === 'skip') {
+            files = files.filter(f => !flaggedPaths.has(f.path));
+            console.log(`Skipping ${flaggedPaths.size} file(s) with potential secrets.`);
+          }
+          // 'ignore' → continue with all files
+          if (action === 'ignore') secretsFilesSkipped = 0;
+        }
+      } else {
+        console.log('✓ No secrets detected');
+      }
+
+      if (files.length === 0) {
+        console.error('✗ No files remaining after secret scan');
+        process.exit(1);
+      }
     }
 
     const totalSize = files.reduce((sum, f) => sum + f.size, 0);
@@ -511,6 +582,9 @@ program
         type: 'cloud',
         workspace_slug: cfg.workspaceSlug,
         trigger: opts.scheduled ? 'scheduled' : 'manual',
+        secrets_found: secretsFound,
+        secrets_files_skipped: secretsFilesSkipped,
+        scan_skipped: scanSkipped,
       });
     } catch (e) {
       const msg = (e as Error).message;
@@ -810,6 +884,7 @@ program
   .description('Preview which files would be included in a backup')
   .option('--include-memory-db', 'Include SQLite memory index')
   .option('--include-sessions', 'Include chat history (sessions)')
+  .option('--scan', 'Run secret scanning on discovered files')
   .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
       console.error(`✗ OpenClaw directory not found: ${OPENCLAW_DIR}`);
@@ -844,6 +919,18 @@ program
 
     console.log(`\nTotal: ${files.length} files (${(totalSize / 1024).toFixed(1)} KB)`);
     console.log(`Source: ${OPENCLAW_DIR}`);
+
+    // Optional secret scan
+    if (opts.scan) {
+      console.log('\nScanning for secrets...');
+      const scanResult = await scanFiles(files, OPENCLAW_DIR);
+      if (scanResult.findings.length > 0) {
+        console.log(formatFindings(scanResult.findings));
+      } else {
+        console.log('✓ No secrets detected');
+      }
+      console.log(`  Scanned ${scanResult.filesScanned} files in ${scanResult.durationMs}ms (${scanResult.rulesLoaded} rules loaded)`);
+    }
 
     const cfg = readConfig();
     trackCliEvent(cfg?.profileId || 'anonymous', 'cli_discover', { file_count: files.length, include_memory_db: !!opts.includeMemoryDb, include_sessions: !!opts.includeSessions });
@@ -1162,6 +1249,7 @@ local
   .option('--include-memory-db', 'Include SQLite memory index')
   .option('--include-sessions', 'Include chat history (sessions)')
   .option('--scheduled', 'Internal: triggered by cron (suppresses interactive output)')
+  .option('--no-secret-scan', 'Skip secret scanning before backup')
   .option('--max-snapshots <n>', 'Keep only the N most recent local backups')
   .action(async (opts) => {
     if (!fs.existsSync(OPENCLAW_DIR)) {
@@ -1171,11 +1259,49 @@ local
 
     try {
       if (!opts.scheduled) console.log('Discovering files...');
-      const files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
+      let files = discoverFiles(OPENCLAW_DIR, !!opts.includeMemoryDb, !!opts.includeSessions);
 
       if (files.length === 0) {
         console.error('✗ No files found to backup');
         process.exit(1);
+      }
+
+      // Secret scanning phase
+      let secretsFound = 0;
+      let secretsFilesSkipped = 0;
+      const scanSkipped = !opts.secretScan;
+
+      if (opts.secretScan) {
+        if (!opts.scheduled) console.log('Scanning for secrets...');
+        const scanResult = await scanFiles(files, OPENCLAW_DIR);
+        secretsFound = scanResult.findings.length;
+
+        if (scanResult.findings.length > 0) {
+          const flaggedPaths = new Set(scanResult.findings.map(f => f.filePath));
+          secretsFilesSkipped = flaggedPaths.size;
+
+          if (opts.scheduled) {
+            files = files.filter(f => !flaggedPaths.has(f.path));
+            console.error(`⚠ Secret scan: skipped ${flaggedPaths.size} file(s) with potential secrets`);
+          } else {
+            const action = await promptSecretAction(scanResult.findings);
+            if (action === 'abort') {
+              console.log('Backup aborted.');
+              process.exit(0);
+            } else if (action === 'skip') {
+              files = files.filter(f => !flaggedPaths.has(f.path));
+              console.log(`Skipping ${flaggedPaths.size} file(s) with potential secrets.`);
+            }
+            if (action === 'ignore') secretsFilesSkipped = 0;
+          }
+        } else {
+          if (!opts.scheduled) console.log('✓ No secrets detected');
+        }
+
+        if (files.length === 0) {
+          console.error('✗ No files remaining after secret scan');
+          process.exit(1);
+        }
       }
 
       const totalSize = files.reduce((sum, f) => sum + f.size, 0);
@@ -1228,6 +1354,9 @@ local
         type: 'local',
         trigger: opts.scheduled ? 'scheduled' : 'manual',
         rotated_count: rotatedCount,
+        secrets_found: secretsFound,
+        secrets_files_skipped: secretsFilesSkipped,
+        scan_skipped: scanSkipped,
       });
     } catch (e) {
       const msg = (e as Error).message;
